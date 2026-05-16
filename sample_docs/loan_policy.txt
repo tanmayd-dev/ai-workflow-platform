@@ -1,0 +1,23 @@
+LOAN APPROVAL POLICY v2.0
+
+1. AUTOMATED APPROVAL CRITERIA
+   - Credit Score must be >= 750
+   - Debt-to-Income (DTI) Ratio must be < 30%
+   - Loan Amount must be <= $50,000
+   - Employment status: Employed for > 2 years
+
+2. MANUAL REVIEW REQUIRED
+   - Credit Score 650-749
+   - DTI Ratio 30-45%
+   - Self-employed applicants
+   - Loan Amounts > $50,000
+
+3. AUTOMATIC REJECTION
+   - Credit Score < 650
+   - DTI Ratio > 50%
+   - Recent bankruptcy (< 7 years)
+
+4. COMPLIANCE CHECKS
+   - CIP (Customer Identification Program) verification required
+   - OFAC check must be CLEAR
+   - TILA (Truth in Lending Act) disclosure generated

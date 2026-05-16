@@ -1,0 +1,25 @@
+
+FRAUD DETECTION POLICY - ACME BANK
+
+High-Risk Transaction Criteria:
+1. Transaction amount exceeds $10,000
+2. Transaction originates from high-risk jurisdiction
+3. Multiple failed authentication attempts in past 24 hours
+4. Transaction pattern deviates significantly from account history
+
+Risk Assessment Requirements:
+- Transactions with risk score > 0.8: Immediate escalation to fraud team with human review required within 2 hours
+- Transactions with risk score 0.5-0.8: Additional verification required, may proceed after automated checks
+- Transactions with risk score < 0.5: Auto-approve with standard monitoring
+
+Mandatory Controls:
+- All transactions over $50,000 require dual approval
+- AI risk assessments must be logged with full context
+- All escalated cases must maintain complete audit trail
+- Decisions must be replayable for regulatory compliance
+
+Approved Processing Steps:
+1. AI analyzes transaction against historical patterns and known fraud indicators
+2. Rule engine evaluates risk score against threshold policies  
+3. Human approval for high-risk or high-value transactions
+4. Final decision logged with complete reasoning chain

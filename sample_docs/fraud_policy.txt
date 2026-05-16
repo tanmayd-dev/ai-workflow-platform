@@ -1,0 +1,43 @@
+FRAUD DETECTION POLICY - RETAIL BANKING
+
+Document Version: 1.2
+Effective Date: January 2026
+Department: Risk Management
+
+POLICY OVERVIEW
+This document establishes the fraud detection and prevention policy for retail banking transactions. All transactions must be evaluated against defined risk criteria before approval.
+
+RISK THRESHOLDS
+1. Transaction Amount Limits
+   - Low Risk: Transactions under $1,000
+   - Medium Risk: Transactions between $1,000 and $10,000
+   - High Risk: Transactions over $10,000
+
+2. Geographic Risk Assessment
+   - Domestic transactions: Standard review
+   - International transactions: Enhanced review required
+   - High-risk countries: Mandatory secondary approval
+
+3. Customer Behavior Analysis
+   - Monitor for unusual patterns
+   - Flag transactions inconsistent with customer history
+   - Require additional verification for suspicious activity
+
+DECISION CRITERIA
+- Automatic Approval: Low risk score AND domestic AND under $1,000
+- Manual Review Required: Medium risk score OR international
+- Immediate Hold: High risk score OR blacklisted country OR fraud indicators
+
+COMPLIANCE REQUIREMENTS
+All decisions must be logged with complete audit trail including:
+- Transaction details
+- Risk assessment results
+- Decision rationale
+- Approver information (if manual review)
+- Timestamp of all actions
+
+ESCALATION PROCEDURES
+Suspicious transactions must be escalated to:
+1. First Level: Branch Manager (Medium Risk)
+2. Second Level: Regional Risk Officer (High Risk)
+3. Third Level: Fraud Investigation Unit (Confirmed Fraud Indicators)

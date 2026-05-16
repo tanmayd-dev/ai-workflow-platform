@@ -1,0 +1,51 @@
+ANTI-MONEY LAUNDERING (AML) REGULATIONS
+
+Document Version: 2.1
+Effective Date: January 2026
+Regulatory Authority: Financial Conduct Authority
+
+TRANSACTION MONITORING REQUIREMENTS
+
+1. SUSPICIOUS ACTIVITY INDICATORS
+   - Multiple small transactions totaling large amounts (structuring)
+   - Rapid movement of funds across multiple accounts
+   - Transactions with no clear business purpose
+   - Involvement of shell companies or offshore entities
+   - Cash-intensive businesses with unusual patterns
+
+2. CUSTOMER DUE DILIGENCE (CDD)
+   Standard CDD Required:
+   - Identity verification for all customers
+   - Source of funds documentation
+   - Regular account activity monitoring
+
+   Enhanced Due Diligence (EDD) Required:
+   - High-net-worth individuals
+   - Politically exposed persons (PEPs)
+   - Businesses in high-risk sectors
+   - Cross-border transactions over $5,000
+
+3. REPORTING OBLIGATIONS
+   - Suspicious Activity Reports (SARs) must be filed within 30 days
+   - Currency Transaction Reports (CTRs) for cash over $10,000
+   - Keep records for minimum 5 years
+   - Cooperate with law enforcement investigations
+
+4. RISK-BASED APPROACH
+   Risk Level Assessment:
+   - Low Risk: Domestic, established customers, regular patterns
+   - Medium Risk: New customers, international transfers, cash transactions
+   - High Risk: PEPs, high-risk jurisdictions, complex ownership structures
+
+   Actions by Risk Level:
+   - Low: Standard monitoring
+   - Medium: Enhanced monitoring + periodic reviews
+   - High: Continuous monitoring + senior management approval
+
+5. COMPLIANCE PROCEDURES
+   All financial institutions must:
+   - Implement automated transaction monitoring systems
+   - Train staff on AML indicators and procedures
+   - Conduct annual AML compliance audits
+   - Maintain board-level oversight of AML program
+   - Report to regulatory authorities quarterly
