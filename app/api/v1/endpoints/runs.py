@@ -123,12 +123,6 @@ async def get_run(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    if run.state_snapshot and isinstance(run.state_snapshot, dict):
-        if "rejection_reason" in run.state_snapshot and not getattr(run, "error_message", None):
-            run.error_message = run.state_snapshot["rejection_reason"]
-        elif "error_message" in run.state_snapshot and not getattr(run, "error_message", None):
-            run.error_message = run.state_snapshot["error_message"]
-
     return run
 
 
@@ -215,12 +209,20 @@ async def reject_run(
     reason = reject_data.get_reason() if reject_data else "Rejected by user"
 
     executor = WorkflowExecutor()
-    run = await executor.reject(
-        run_id=run_id,
-        reason=reason,
-        db=db,
-        user=current_user
-    )
+    try:
+        run = await executor.reject(
+            run_id=run_id,
+            reason=reason,
+            db=db,
+            user=current_user
+        )
+    except Exception:
+        # Same policy as approve: the run row carries the outcome; a racing
+        # loser lands here after refresh and simply reflects the winner's row.
+        logger.exception("Rejection execution failed for run %s; returning FAILED run row", run_id)
+        await db.refresh(run)
+        return run
+
     return run
 
 
