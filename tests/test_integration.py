@@ -19,7 +19,7 @@ from app.main import app
 from app.models.user import User
 from app.models.rule import Rule, RuleVersion
 from app.models.workflow import WorkflowDefinition, WorkflowStep, StepType, WorkflowStatus
-from app.models.execution import RunStatus, WorkflowRun
+from app.models.execution import RunStatus, WorkflowRun, NodeStatus
 from app.services.executor import WorkflowExecutor
 
 
@@ -116,6 +116,65 @@ async def sample_workflow(db_session: AsyncSession, sample_user: User):
             id=uuid4(),
             workflow_id=workflow.id,
             order_index=1,
+            step_type=StepType.DOMAIN_RULE,
+            name="Threshold Check",
+            description="Apply risk threshold rules",
+            config_json={
+                "rule_id": "high_risk_threshold"
+            }
+        )
+    ]
+
+    for step in steps:
+        db_session.add(step)
+
+    await db_session.commit()
+    await db_session.refresh(workflow)
+    return workflow
+
+
+@pytest.fixture
+async def approval_workflow(db_session: AsyncSession, sample_user: User):
+    """Create an APPROVED workflow with AI step + Approval step + Rule step."""
+    workflow = WorkflowDefinition(
+        id=uuid4(),
+        name="Test Approval Workflow",
+        description="Workflow with AI analysis, human approval, and domain rule",
+        domain="fraud",
+        version=1,
+        status=WorkflowStatus.APPROVED,
+        is_active=True,
+        created_by=sample_user.id,
+        approved_by=sample_user.id
+    )
+    db_session.add(workflow)
+    await db_session.flush()
+
+    steps = [
+        WorkflowStep(
+            id=uuid4(),
+            workflow_id=workflow.id,
+            order_index=0,
+            step_type=StepType.AI_ANALYSIS,
+            name="Risk Analysis",
+            description="AI analyzes transaction risk",
+            config_json={
+                "prompt_template": "Analyze this transaction for fraud risk"
+            }
+        ),
+        WorkflowStep(
+            id=uuid4(),
+            workflow_id=workflow.id,
+            order_index=1,
+            step_type=StepType.HUMAN_APPROVAL,
+            name="Fraud Manager Approval",
+            description="Human reviewer must approve transaction before decision rules execute",
+            config_json={}
+        ),
+        WorkflowStep(
+            id=uuid4(),
+            workflow_id=workflow.id,
+            order_index=2,
             step_type=StepType.DOMAIN_RULE,
             name="Threshold Check",
             description="Apply risk threshold rules",
@@ -319,3 +378,210 @@ def test_run_endpoint_fails_without_rule(client, sample_workflow, mock_llm):
     })
     assert created.status_code == 201, created.text
     assert created.json()["status"] == RunStatus.FAILED.value
+
+
+def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, high_risk_rule, mock_llm):
+    """
+    Workflow with AI step + approval step + rule step:
+    - posted to POST /runs, returns status PAUSED
+    - approving it via POST /runs/{id}/approve drives it to COMPLETED
+    - rule step executes and is audited in GET /runs/{id}/executions
+    - replay via POST /runs/{id}/replay works end-to-end on resumed run
+    """
+    email = f"approver_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Approver User"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    input_data = {"transaction_id": "TX_APPROVAL_1", "amount": 60000, "risk_score": 0.88}
+
+    # 1. Post run -> reaches HUMAN_APPROVAL step and pauses
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_APP_1",
+        "input_data": input_data,
+        "trigger_reason": "High fraud score requires human approval"
+    })
+    assert created.status_code == 201, created.text
+    run = created.json()
+    run_id = run["id"]
+    assert run["status"] == RunStatus.PAUSED.value
+    assert run["current_step_index"] == 1
+
+    # 2. Check executions while paused: AI step COMPLETED, Approval step PENDING, Rule step not run
+    executions_paused = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    assert len(executions_paused) == 2
+    assert executions_paused[0]["node_type"] == StepType.AI_ANALYSIS.value
+    assert executions_paused[0]["status"] == NodeStatus.COMPLETED.value
+    assert executions_paused[1]["node_type"] == StepType.HUMAN_APPROVAL.value
+    assert executions_paused[1]["status"] == NodeStatus.PENDING.value
+
+    # 3. Approve via POST /runs/{run_id}/approve
+    approve_resp = client.post(
+        f"/api/v1/runs/{run_id}/approve",
+        headers=headers,
+        json={"notes": "Manager verified via phone call"}
+    )
+    assert approve_resp.status_code == 200, approve_resp.text
+    approved_run = approve_resp.json()
+    assert approved_run["status"] == RunStatus.COMPLETED.value
+
+    # 4. Check executions after approval: all 3 steps COMPLETED, rule step evaluated
+    executions_completed = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    assert len(executions_completed) == 3
+    assert executions_completed[0]["status"] == NodeStatus.COMPLETED.value
+    assert executions_completed[1]["status"] == NodeStatus.COMPLETED.value
+    assert executions_completed[1]["output_snapshot"]["approved"] is True
+    assert executions_completed[1]["output_snapshot"]["notes"] == "Manager verified via phone call"
+    assert executions_completed[2]["node_type"] == StepType.DOMAIN_RULE.value
+    assert executions_completed[2]["status"] == NodeStatus.COMPLETED.value
+    assert executions_completed[2]["output_snapshot"] == "ESCALATE"
+
+    # 5. Replay must work end-to-end on the resumed run
+    replay_resp = client.post(f"/api/v1/runs/{run_id}/replay", headers=headers)
+    assert replay_resp.status_code == 201, replay_resp.text
+    replayed = replay_resp.json()
+    assert replayed["status"] == RunStatus.COMPLETED.value
+    assert replayed["id"] != run_id
+
+    # Verify replay node executions are also all completed
+    replay_execs = client.get(f"/api/v1/runs/{replayed['id']}/executions").json()
+    assert len(replay_execs) == 3
+    assert all(e["status"] == NodeStatus.COMPLETED.value for e in replay_execs)
+
+
+def test_approval_flow_rejection(client, approval_workflow, high_risk_rule, mock_llm):
+    """
+    A rejected run ends FAILED with the rejection reason recorded:
+    - approval step marked FAILED with reason
+    - following steps not executed
+    """
+    email = f"rejector_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Rejector User"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_REJ_1",
+        "input_data": {"risk_score": 0.99},
+    })
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["status"] == RunStatus.PAUSED.value
+
+    # Reject run
+    rejection_reason = "Transaction flagged as confirmed identity fraud"
+    reject_resp = client.post(
+        f"/api/v1/runs/{run_id}/reject",
+        headers=headers,
+        json={"reason": rejection_reason}
+    )
+    assert reject_resp.status_code == 200, reject_resp.text
+    rejected_run = reject_resp.json()
+    assert rejected_run["status"] == RunStatus.FAILED.value
+    assert rejected_run["error_message"] == rejection_reason
+
+    # Audit check: approval node execution is FAILED with rejection reason
+    executions = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    assert len(executions) == 2
+    assert executions[0]["status"] == NodeStatus.COMPLETED.value
+    assert executions[1]["status"] == NodeStatus.FAILED.value
+    assert executions[1]["error_message"] == rejection_reason
+    assert executions[1]["output_snapshot"]["approved"] is False
+
+    # GET /runs/{run_id} also shows FAILED and error_message
+    get_run_resp = client.get(f"/api/v1/runs/{run_id}").json()
+    assert get_run_resp["status"] == RunStatus.FAILED.value
+    assert get_run_resp["error_message"] == rejection_reason
+
+
+def test_approval_endpoints_non_paused_error(client, approval_workflow, sample_workflow, high_risk_rule, mock_llm):
+    """
+    Reject on non-PAUSED runs -> 400.
+    Approving twice -> 400.
+    """
+    email = f"error_tester_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Tester"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # 1. Normal workflow that completes without pausing
+    norm_run = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(sample_workflow.id),
+        "account_id": "ACC_NORM",
+        "input_data": {"risk_score": 0.85},
+    }).json()
+    assert norm_run["status"] == RunStatus.COMPLETED.value
+
+    # Approve on non-paused run -> 400
+    res = client.post(f"/api/v1/runs/{norm_run['id']}/approve", headers=headers)
+    assert res.status_code == 400, res.text
+
+    # Reject on non-paused run -> 400
+    res = client.post(f"/api/v1/runs/{norm_run['id']}/reject", headers=headers)
+    assert res.status_code == 400, res.text
+
+    # 2. Approval workflow: pause then approve
+    paused_run = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_PAUSED_ERR",
+        "input_data": {"risk_score": 0.85},
+    }).json()
+    assert paused_run["status"] == RunStatus.PAUSED.value
+
+    # First approve succeeds -> COMPLETED
+    res = client.post(f"/api/v1/runs/{paused_run['id']}/approve", headers=headers)
+    assert res.status_code == 200
+
+    # Approving twice -> 400
+    res = client.post(f"/api/v1/runs/{paused_run['id']}/approve", headers=headers)
+    assert res.status_code == 400, res.text
+
+    # Rejecting now that it is COMPLETED -> 400
+    res = client.post(f"/api/v1/runs/{paused_run['id']}/reject", headers=headers)
+    assert res.status_code == 400, res.text
+
+    # 3. Nonexistent run -> 404
+    random_id = str(uuid4())
+    assert client.post(f"/api/v1/runs/{random_id}/approve", headers=headers).status_code == 404
+    assert client.post(f"/api/v1/runs/{random_id}/reject", headers=headers).status_code == 404
+
+    # 4. Unauthenticated calls -> 401
+    assert client.post(f"/api/v1/runs/{paused_run['id']}/approve").status_code == 401
+    assert client.post(f"/api/v1/runs/{paused_run['id']}/reject").status_code == 401
+
+
+def test_approval_workflow_missing_rule_fails(client, approval_workflow, mock_llm):
+    """The executor rule-fix semantics (a missing rule => run FAILED, row persisted) are preserved on approval workflows."""
+    email = f"rule_fail_runner_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Rule Fail User"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # approval_workflow references "high_risk_threshold", which is not seeded in this test
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_MISSING_RULE",
+        "input_data": {"risk_score": 0.5},
+    })
+    assert created.status_code == 201, created.text
+    run_body = created.json()
+    assert run_body["status"] == RunStatus.FAILED.value
+    assert "high_risk_threshold" in run_body["error_message"]
