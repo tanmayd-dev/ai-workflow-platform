@@ -1,5 +1,5 @@
 """Pydantic schemas for API request/response validation."""
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from uuid import UUID
@@ -117,19 +117,42 @@ class RuleVersionCreate(BaseModel):
     logic_json: Dict[str, Any]
 
 
+class RuleVersionResponse(BaseModel):
+    id: UUID
+    rule_id: UUID
+    version_number: int
+    logic_json: Dict[str, Any]
+    is_active: bool
+    created_at: datetime
+    created_by: UUID
+
+    class Config:
+        from_attributes = True
+
+
 class RuleCreate(BaseModel):
     name: str
     description: Optional[str] = None
     domain: str
-    initial_logic: Dict[str, Any]
+    initial_logic: Optional[Dict[str, Any]] = None
+    logic_json: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_logic(self):
+        if self.logic_json is None and self.initial_logic is None:
+            raise ValueError("Rule logic must be provided via logic_json or initial_logic")
+        if self.logic_json is None:
+            self.logic_json = self.initial_logic
+        return self
 
 
 class RuleResponse(BaseModel):
     id: UUID
     name: str
     domain: str
-    description: Optional[str]
+    description: Optional[str] = None
     created_at: datetime
+    versions: List[RuleVersionResponse] = []
     
     class Config:
         from_attributes = True
