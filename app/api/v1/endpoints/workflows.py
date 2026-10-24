@@ -7,6 +7,8 @@ from typing import List
 from uuid import uuid4, UUID
 
 from app.core.database import get_db
+from app.api.v1.endpoints.auth import get_current_active_user
+from app.models.user import User
 from app.models.workflow import WorkflowDefinition, WorkflowStep, WorkflowStatus
 from app.schemas import WorkflowCreate, WorkflowResponse
 
@@ -16,7 +18,8 @@ router = APIRouter()
 @router.post("/draft", response_model=WorkflowResponse, status_code=201)
 async def create_draft_workflow(
     workflow_data: WorkflowCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
     """
     Create a draft workflow definition.
@@ -24,8 +27,7 @@ async def create_draft_workflow(
     - Status: DRAFT
     - Mutable until approved
     """
-    # TODO: Get user from auth context
-    user_id = uuid4()
+    user_id = current_user.id
     
     workflow = WorkflowDefinition(
         id=uuid4(),
@@ -107,7 +109,8 @@ async def get_workflow(
 @router.post("/{workflow_id}/approve", response_model=WorkflowResponse)
 async def approve_workflow(
     workflow_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
     """
     Approve a workflow definition.
@@ -129,8 +132,7 @@ async def approve_workflow(
     if workflow.status != WorkflowStatus.DRAFT:
         raise HTTPException(status_code=400, detail="Only DRAFT workflows can be approved")
     
-    # TODO: Get user from auth
-    user_id = uuid4()
+    user_id = current_user.id
     
     from datetime import datetime
     workflow.status = WorkflowStatus.APPROVED

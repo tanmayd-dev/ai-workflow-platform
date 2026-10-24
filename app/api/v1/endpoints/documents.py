@@ -9,6 +9,8 @@ from pathlib import Path
 
 from app.core.database import get_db
 from app.core.config import get_settings
+from app.api.v1.endpoints.auth import get_current_active_user
+from app.models.user import User
 from app.models.document import Document
 from app.schemas import DocumentCreate, DocumentResponse
 from app.services.rag_service import RAGService
@@ -23,7 +25,8 @@ async def upload_document(
     file: UploadFile = File(...),
     domain: str = Form("general"),
     description: str = Form(None),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
     """
     Upload a document to the knowledge base.
@@ -65,8 +68,7 @@ async def upload_document(
     content_hash = rag_service.compute_content_hash(text_content)
     
     # Create database record
-    # TODO: Get user ID from auth context
-    user_id = uuid4()  # Placeholder
+    user_id = current_user.id
     
     doc = Document(
         id=doc_id,

@@ -45,7 +45,7 @@ class RAGService:
         collection_name = f"domain_{domain}"
         try:
             collection = self.client.get_collection(name=collection_name)
-        except:
+        except Exception:
             collection = self.client.create_collection(
                 name=collection_name,
                 metadata={"domain": domain}

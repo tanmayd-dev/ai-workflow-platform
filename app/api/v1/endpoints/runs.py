@@ -1,4 +1,5 @@
 """Workflow execution endpoints."""
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
@@ -15,6 +16,8 @@ from app.schemas import RunCreate, RunResponse, NodeExecutionResponse
 from app.services.executor import WorkflowExecutor
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 @router.post("/", response_model=RunResponse, status_code=201)
@@ -91,6 +94,8 @@ async def create_run(
             triggered_by=current_user.id
         )
     except Exception:
+        # The run row (and its audit trail) stays; surface WHY it failed.
+        logger.exception("Run execution failed for run %s; returning FAILED/partial run row", run.id)
         await db.refresh(run)
         return run
 

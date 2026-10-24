@@ -97,8 +97,8 @@ app/
 
 - Human-approval nodes auto-approve — a real pending-state + approve/reject
   endpoint loop is the natural next feature.
-- Auth is only enforced on the `/runs` endpoints; other endpoints still log a
-  placeholder user.
+- Auth is enforced on `/runs` plus workflow draft/approve and document upload;
+  remaining endpoints gain auth as they are added (rules next).
 - The root-level scripts duplicate each other (4 API smoke scripts, 3 demos,
   2 seeders); consolidation is pending.
 - Runs execute synchronously inside the HTTP request; long executions belong in

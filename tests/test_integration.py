@@ -160,7 +160,7 @@ def test_authentication_flow(client):
 
 
 @pytest.mark.asyncio
-async def test_workflow_execution(db_session: AsyncSession, sample_workflow: WorkflowDefinition, mock_llm):
+async def test_workflow_execution(db_session: AsyncSession, sample_workflow: WorkflowDefinition, high_risk_rule, mock_llm):
     """Direct executor test: run completes and persists node executions."""
     executor = WorkflowExecutor()
 
@@ -185,7 +185,7 @@ async def test_workflow_execution(db_session: AsyncSession, sample_workflow: Wor
 
 
 @pytest.mark.asyncio
-async def test_workflow_replay(db_session: AsyncSession, sample_workflow: WorkflowDefinition, mock_llm):
+async def test_workflow_replay(db_session: AsyncSession, sample_workflow: WorkflowDefinition, high_risk_rule, mock_llm):
     """Direct executor test: replay re-executes with the stored inputs."""
     executor = WorkflowExecutor()
 
@@ -264,6 +264,41 @@ def test_run_endpoint_executes_workflow(client, sample_workflow, high_risk_rule,
     replay = client.post(f"/api/v1/runs/{run['id']}/replay", headers=headers)
     assert replay.status_code == 201, replay.text
     assert replay.json()["status"] == RunStatus.COMPLETED.value
+
+
+def test_workflow_endpoints_require_auth_and_record_user(client):
+    """Draft/approve record the JWT caller (not a placeholder UUID); 401 without a token."""
+    email = f"author_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Author"
+    })
+    login = client.post("/api/v1/auth/login", data={"username": email, "password": "testpass123"})
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    me = client.get("/api/v1/auth/me", headers=headers).json()
+
+    created = client.post("/api/v1/workflows/draft", headers=headers, json={
+        "name": "Auth Audit Workflow",
+        "domain": "fraud",
+        "steps": [
+            {"order_index": 0, "step_type": "AI_ANALYSIS", "name": "Analyze"},
+        ],
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    # created_by must be the authenticated user, not a random uuid4()
+    assert body["created_by"] == me["id"], body
+
+    approved = client.post(f"/api/v1/workflows/{body['id']}/approve", headers=headers)
+    assert approved.status_code == 200, approved.text
+    # approved_by must be the authenticated user as well
+    assert approved.json()["approved_by"] == me["id"]
+
+    # Unauthenticated mutations are now rejected
+    assert client.post("/api/v1/workflows/draft", json={
+        "name": "no token", "domain": "fraud", "steps": []
+    }).status_code == 401
+    assert client.post("/api/v1/documents/upload").status_code == 401
 
 
 def test_run_endpoint_fails_without_rule(client, sample_workflow, mock_llm):

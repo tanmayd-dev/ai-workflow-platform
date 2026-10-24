@@ -48,6 +48,7 @@ class DocumentResponse(BaseModel):
     description: Optional[str]
     file_size: int
     chunk_count: int
+    uploaded_by: Optional[UUID] = None
     uploaded_at: datetime
     
     class Config:
@@ -90,6 +91,8 @@ class WorkflowResponse(BaseModel):
     version: int
     status: WorkflowStatus
     is_active: bool
+    created_by: Optional[UUID] = None
+    approved_by: Optional[UUID] = None
     created_at: datetime
     approved_at: Optional[datetime]
     steps: List[WorkflowStepResponse] = []
@@ -157,8 +160,10 @@ class NodeExecutionResponse(BaseModel):
     id: UUID
     node_type: str
     status: NodeStatus
-    input_snapshot: Optional[Dict[str, Any]]
-    output_snapshot: Optional[Dict[str, Any]]
+    # Snapshots are JSONB columns: AI output dicts, rule scalars, or nested
+    # documents — validate as any JSON, not dict-only.
+    input_snapshot: Optional[Any]
+    output_snapshot: Optional[Any]
     started_at: datetime
     completed_at: Optional[datetime]
     
