@@ -1,3 +1,0 @@
-from sqlalchemy import Boolean
-
-# Import missing Boolean type that's needed in rule.py

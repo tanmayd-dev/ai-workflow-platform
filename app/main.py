@@ -33,11 +33,11 @@ async def startup_event():
     try:
         await init_db()
         print(f"✓ {settings.PROJECT_NAME} started successfully")
-        print(f"✓ API docs available at http://localhost:8000{settings.API_V1_STR}/docs")
+        print(f"✓ API docs available at http://localhost:8000/docs")
     except Exception as e:
         print(f"Note: Database initialization skipped or tables already exist: {e}")
         print(f"✓ {settings.PROJECT_NAME} started successfully")
-        print(f"✓ API docs available at http://localhost:8000{settings.API_V1_STR}/docs")
+        print(f"✓ API docs available at http://localhost:8000/docs")
 
 
 @app.get("/")

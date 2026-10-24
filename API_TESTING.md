@@ -4,12 +4,13 @@
 
 ```bash
 # From project root
-.venv\Scripts\python.exe -m app.main
+source .venv/bin/activate
+python -m app.main
 ```
 
 Server will be available at: http://localhost:8000
 
-API Documentation (Swagger UI): http://localhost:8000/api/v1/docs
+API Documentation (Swagger UI): http://localhost:8000/docs
 
 ## Test Endpoints
 

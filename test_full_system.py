@@ -224,7 +224,7 @@ if __name__ == "__main__":
     print("="*70)
     
     if test_results['failed'] == 0:
-        print("\n🎉 ALL TESTS PASSED! SYSTEM FULLY OPERATIONAL 🎉\n")
+        print(f"\nAll {test_results['total']} manual smoke tests passed.\n")
         exit(0)
     else:
         print(f"\n⚠️  {test_results['failed']} TEST(S) FAILED\n")

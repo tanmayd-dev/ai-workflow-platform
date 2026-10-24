@@ -1,79 +1,83 @@
 # AI-Driven Enterprise Decision Workflow Platform
 
-## Overview
-A regulated AI-governed workflow orchestration system for banking operations. This system demonstrates how AI can assist in decision-making while maintaining strict governance, auditability, and regulatory compliance.
+A prototype of an AI-governed workflow orchestration system for banking operations:
+AI drafts workflows from natural-language intents, deterministic rules bound the
+decisions, and every step is recorded for audit and replay.
 
-## Key Features
-- **AI-Assisted Workflow Design**: LLMs draft workflows based on natural language intent
-- **Hybrid Decision Control**: AI suggests, deterministic rules decide
-- **Full Audit Trail**: Every decision is logged and replayable
-- **Knowledge Base (RAG)**: Domain-agnostic via uploaded regulatory documents
-- **Immutable Workflows**: Approved workflows are frozen and versioned
-- **Account-Level Serialization**: One active run per account
+**This is a work-in-progress prototype, not a deployed system.** The status table
+below is the single source of truth for what works; this project previously
+carried self-congratulatory status docs (`PROJECT_COMPLETE.md`, `SYSTEM_COMPLETE.md`,
+etc.) whose claims contradicted each other — they were removed and replaced by
+this table.
+
+## Verified state
+
+| Area | Status | Notes |
+|---|---|---|
+| Auth (register/login/me) | ✅ Works | SHA-256+salt password hashing, JWT bearer tokens (see note below) |
+| Document upload + RAG ingestion | ✅ Works | ChromaDB + HuggingFace embeddings, per-domain collections |
+| Workflow CRUD (draft/approve/freeze) | ✅ Works | `created_by` is still a placeholder UUID, not the caller |
+| Workflow | ✅ Works | Compiles to a real LangGraph `StateGraph` (AI / rule / approval / conditional nodes) |
+| Execution from the HTTP API | ✅ Works (Phase 3) | `POST /api/v1/runs` drives the executor; LLM output mocked in tests |
+| Replay | ✅ Works (Phase 3) | `POST /api/v1/runs/{id}/replay` re-executes with stored inputs |
+| Intent drafting (`POST /api/v1/intents/draft`) | ⚠️ Requires LLM | Calls OpenRouter; no offline test coverage |
+| RAG context inside AI nodes | ⚠️ Best-effort | Retrieval is attempted when `ENABLE_RAG=true`; empty context on failure |
+| Human approval steps | ⚠️ Simulated | Approval nodes auto-approve with a "system" signature; no pending-state loop yet |
+| Rules resolution | ✅ Works | Rule logic is loaded from `rules`/`rule_versions` tables (was hardcoded before) |
+| Tests | ✅ `pytest -q` | In-process tests (`TestClient` + direct executor), LLM mocked |
+| Config bootstrap | ✅ Works | `.env.example` included |
+| Docker / CI | ❌ None | No Dockerfile, no CI pipeline |
+| Auth migrations | ⚠️ Manual | `alembic upgrade head` for existing DBs; fresh DBs via `startup` |
+
+Security note: password hashing is SHA-256+salt (stdlib), not bcrypt. For a
+prototype this is acceptable; for anything real, switch to bcrypt/argon2.
 
 ## Tech Stack
+
 - **Backend**: FastAPI (Python 3.10+)
-- **Database**: SQLite + SQLAlchemy (async)
-- **AI/LLM**: OpenRouter (pony-alpha model)
-- **Vector Store**: ChromaDB + HuggingFace Embeddings
+- **Database**: SQLite + SQLAlchemy (async), Alembic migrations
+- **AI/LLM**: OpenRouter (any chat model, default configured via env)
+- **Vector Store**: ChromaDB + HuggingFace embeddings
 - **Orchestration**: LangGraph
-- **Auth**: JWT + RBAC
 
-## Installation
+## Setup
 
-### Prerequisites
-- Python 3.10+
-- Virtual environment
-
-### Setup
 ```bash
-# Clone repository
-git clone <repository-url>
-cd "AI-Driven Enterprise Decision Workflow Platform"
+git clone https://github.com/tanmayd-dev/ai-workflow-platform.git
+cd ai-workflow-platform
 
-# Create and activate virtual environment
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # Linux/Mac
+source .venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # only needed for running the tests
 
-# Configure environment
-cp .env.example .env
-# Edit .env with your OPENROUTER_API_KEY
+cp .env.example .env                  # fill in OPENROUTER_API_KEY and SECRET_KEY
+alembic upgrade head                  # only if a DB already exists; fresh DBs auto-create
 
-# Run migrations
-alembic upgrade head
-
-# Start server
 python -m app.main
 ```
 
-## Usage
+Server is at `http://localhost:8000`; Swagger UI at `http://localhost:8000/docs`
+(the API itself lives under `http://localhost:8000/api/v1`).
 
-Server will be available at `http://localhost:8000`
+For sample users/workflows/rules, run `python seed_data.py` (full demo dataset)
+or `python seed_simple.py` (minimal). `.env` must be configured first, since the
+seed script imports the app and needs `OPENROUTER_API_KEY`/`SECRET_KEY`.
 
-- **API Docs**: http://localhost:8000/docs
-- **Health Check**: http://localhost:8000/health
+## Tests
 
-## Architecture
+```bash
+pytest -q
+```
 
-### Core Subsystems
-1. **Knowledge Base (RAG)**: Upload domain-specific documents
-2. **Workflow Definition**: Design and approve workflows
-3. **Rules Engine**: Deterministic JSON DSL evaluation
-4. **Execution Engine**: LangGraph-based state machine
-5. **Audit & Replay**: Full execution tracking and verification
+Tests run against a throwaway SQLite file via the in-process app; LLM calls are
+mocked, so no API key is consumed. `scripts/` (root-level `test_*.py`, `demo*.py`,
+`execute_*.py`) are manual smoke scripts from development — they hit a live
+server at `127.0.0.1:8000` and are not part of the test suite.
 
-### Database Schema
-- **Users & Roles**: RBAC authentication
-- **Workflow Definitions**: Immutable, versioned workflows
-- **Rules**: Global, versioned JSON DSL rules
-- **Execution**: Runs, node executions, audit logs
-- **Documents**: Knowledge base metadata
+## Project structure
 
-## Project Structure
 ```
 app/
 ├── main.py                 # FastAPI entrypoint
@@ -81,15 +85,30 @@ app/
 ├── models/                 # SQLAlchemy models
 ├── schemas/                # Pydantic schemas
 ├── services/               # Business logic
-│   ├── rag_service.py     # Vector store & retrieval
-│   ├── llm_service.py     # OpenRouter client
-│   ├── rule_engine.py     # JSON DSL evaluator
-│   └── compiler.py        # Workflow → LangGraph
+│   ├── rag_service.py      # ChromaDB + embeddings
+│   ├── llm_service.py      # OpenRouter client
+│   ├── rule_engine.py      # JSON DSL evaluator
+│   ├── compiler.py         # Workflow → LangGraph graph
+│   └── executor.py         # Graph execution + persistence
 └── api/v1/endpoints/       # REST API endpoints
 ```
 
+## Known limitations / next steps
+
+- Human-approval nodes auto-approve — a real pending-state + approve/reject
+  endpoint loop is the natural next feature.
+- Auth is only enforced on the `/runs` endpoints; other endpoints still log a
+  placeholder user.
+- The root-level scripts duplicate each other (4 API smoke scripts, 3 demos,
+  2 seeders); consolidation is pending.
+- Runs execute synchronously inside the HTTP request; long executions belong in
+  a background task/queue.
+- No Docker, CI, or LICENSE tracking.
+
 ## License
+
 MIT
 
 ## Author
+
 Tanmay Deshpande
