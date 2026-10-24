@@ -6,11 +6,14 @@ These tests run entirely in-process:
 - executor tests call `WorkflowExecutor` directly
 - LLM calls are mocked by the `mock_llm` fixture in conftest.py
 """
-from uuid import uuid4
+import asyncio
+from datetime import datetime
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_maker
@@ -19,7 +22,7 @@ from app.main import app
 from app.models.user import User
 from app.models.rule import Rule, RuleVersion
 from app.models.workflow import WorkflowDefinition, WorkflowStep, StepType, WorkflowStatus
-from app.models.execution import RunStatus, WorkflowRun, NodeStatus
+from app.models.execution import RunStatus, WorkflowRun, NodeStatus, NodeExecution
 from app.services.executor import WorkflowExecutor
 
 
@@ -585,3 +588,137 @@ def test_approval_workflow_missing_rule_fails(client, approval_workflow, mock_ll
     run_body = created.json()
     assert run_body["status"] == RunStatus.FAILED.value
     assert "high_risk_threshold" in run_body["error_message"]
+
+
+async def test_rejected_run_error_message_persists_in_database(client, approval_workflow, high_risk_rule, mock_llm):
+    """
+    The rejection reason must live in the committed workflow_runs row
+    (read through an independent session), not merely in request-scoped
+    response state — the durable-audit requirement for failure reasons.
+    """
+    email = f"persist_check_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Persist Checker"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_PERSIST",
+        "input_data": {"risk_score": 0.9},
+    })
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["status"] == RunStatus.PAUSED.value
+
+    rejection_reason = "Rejected: reason must survive request scope"
+    reject_resp = client.post(
+        f"/api/v1/runs/{run_id}/reject",
+        headers=headers,
+        json={"reason": rejection_reason}
+    )
+    assert reject_resp.status_code == 200, reject_resp.text
+
+    async def _read_committed_row():
+        session_maker = get_session_maker()
+        async with session_maker() as session:
+            return (await session.execute(
+                select(WorkflowRun).where(WorkflowRun.id == UUID(run_id))
+            )).scalar_one()
+
+    row = await _read_committed_row()
+    assert row.status == RunStatus.FAILED
+    assert row.error_message == rejection_reason
+
+
+def test_racing_verdict_conflict_returns_409(client, approval_workflow, high_risk_rule, mock_llm, monkeypatch):
+    """
+    A verdict request whose CAS claim loses (simulated) must answer 409 —
+    NOT 200 with the winner's row — because that approve/rejection did not
+    actually apply.
+    """
+    email = f"race409_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Race 409"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_RACE_409",
+        "input_data": {"risk_score": 0.9},
+    })
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["status"] == RunStatus.PAUSED.value
+
+    async def lost_claim_resume(self, run_id, verdict, db):
+        raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
+
+    async def lost_claim_reject(self, run_id, reason, db, user=None):
+        raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
+
+    monkeypatch.setattr(WorkflowExecutor, "resume", lost_claim_resume)
+    conflict = client.post(f"/api/v1/runs/{run_id}/approve", headers=headers)
+    assert conflict.status_code == 409, conflict.text
+    assert "not in PAUSED" in conflict.text
+
+    monkeypatch.setattr(WorkflowExecutor, "reject", lost_claim_reject)
+    conflict = client.post(f"/api/v1/runs/{run_id}/reject", headers=headers)
+    assert conflict.status_code == 409, conflict.text
+    assert "not in PAUSED" in conflict.text
+
+
+async def test_concurrent_approves_exactly_one_wins(db_session, approval_workflow, high_risk_rule, mock_llm):
+    """
+    Two simultaneous approve attempts on one PAUSED run: the compare-and-swap
+    claim must let exactly one proceed, fail the other closed ('not in
+    PAUSED'), and never execute a step twice (no duplicated audit rows).
+    """
+    executor = WorkflowExecutor()
+    run = await executor.execute(
+        workflow_id=approval_workflow.id,
+        input_data={"risk_score": 0.9},
+        account_id="ACC_RACE",
+        db=db_session
+    )
+    assert run.status == RunStatus.PAUSED
+
+    session_maker = get_session_maker()
+
+    async def attempt():
+        async with session_maker() as session:
+            return await WorkflowExecutor().resume(
+                run.id,
+                {
+                    "approved": True,
+                    "approver": "racer@example.com",
+                    "notes": "race claim",
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                session,
+            )
+
+    results = await asyncio.gather(attempt(), attempt(), return_exceptions=True)
+    succeeded = [r for r in results if not isinstance(r, BaseException)]
+    failed = [r for r in results if isinstance(r, BaseException)]
+
+    assert len(succeeded) == 1, results
+    assert len(failed) == 1, results
+    assert "not in PAUSED" in str(failed[0])
+
+    # No double execution: the winner leaves exactly 3 COMPLETED node rows.
+    async with session_maker() as audit_session:
+        fresh = await audit_session.get(WorkflowRun, run.id)
+        assert fresh.status == RunStatus.COMPLETED
+        execs = (await audit_session.execute(
+            select(NodeExecution).where(NodeExecution.run_id == run.id)
+        )).scalars().all()
+        assert len(execs) == 3
+        assert all(e.status == NodeStatus.COMPLETED for e in execs)

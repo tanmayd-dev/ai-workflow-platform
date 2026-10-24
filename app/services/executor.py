@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from datetime import datetime
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from app.models.rule import Rule, RuleVersion
@@ -270,14 +270,26 @@ class WorkflowExecutor:
         Returns:
             WorkflowRun with execution results
         """
+        # Atomic claim via compare-and-swap: only a caller that moves the run
+        # PAUSED -> RUNNING wins. Losers get rowcount 0 and fail closed.
+        claim = await db.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == run_id, WorkflowRun.status == RunStatus.PAUSED)
+            .values(status=RunStatus.RUNNING)
+        )
         result = await db.execute(
-            select(WorkflowRun).where(WorkflowRun.id == run_id)
+            select(WorkflowRun)
+            .where(WorkflowRun.id == run_id)
+            .execution_options(populate_existing=True)  # fresh attributes even for a stale identity map
         )
         run = result.scalar_one_or_none()
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
-        if run.status != RunStatus.PAUSED:
+        if claim.rowcount == 0 or not run:
+            if not run:
+                raise ValueError(f"Run {run_id} not found")
             raise ValueError(f"Run {run_id} is not in PAUSED status (current: {run.status})")
+        # Sync the ORM identity map with the CAS write so later explicit status
+        # transitions (COMPLETED / PAUSED / FAILED) always flush.
+        await db.refresh(run)
 
         run_pk = run.id
 
@@ -475,14 +487,25 @@ class WorkflowExecutor:
         Returns:
             WorkflowRun with status FAILED
         """
+        # Atomic claim via compare-and-swap: PAUSED -> FAILED happens iff the
+        # run is still PAUSED, so concurrent approve/reject cannot double-fire.
+        claim = await db.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == run_id, WorkflowRun.status == RunStatus.PAUSED)
+            .values(status=RunStatus.FAILED)
+        )
         result = await db.execute(
-            select(WorkflowRun).where(WorkflowRun.id == run_id)
+            select(WorkflowRun)
+            .where(WorkflowRun.id == run_id)
+            .execution_options(populate_existing=True)  # fresh attributes even for a stale identity map
         )
         run = result.scalar_one_or_none()
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
-        if run.status != RunStatus.PAUSED:
+        if claim.rowcount == 0 or not run:
+            if not run:
+                raise ValueError(f"Run {run_id} not found")
             raise ValueError(f"Run {run_id} is not in PAUSED status (current: {run.status})")
+        # Sync the ORM identity map with the CAS write.
+        await db.refresh(run)
 
         run_pk = run.id
         try:
@@ -515,7 +538,6 @@ class WorkflowExecutor:
 
             await db.commit()
             await db.refresh(run)
-            run.error_message = reason
             return run
         except Exception as e:
             run.status = RunStatus.FAILED

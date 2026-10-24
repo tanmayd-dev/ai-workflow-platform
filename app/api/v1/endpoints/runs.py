@@ -123,12 +123,6 @@ async def get_run(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    if run.state_snapshot and isinstance(run.state_snapshot, dict):
-        if "rejection_reason" in run.state_snapshot and not getattr(run, "error_message", None):
-            run.error_message = run.state_snapshot["rejection_reason"]
-        elif "error_message" in run.state_snapshot and not getattr(run, "error_message", None):
-            run.error_message = run.state_snapshot["error_message"]
-
     return run
 
 
@@ -176,6 +170,11 @@ async def approve_run(
             verdict=verdict,
             db=db
         )
+    except ValueError as ve:
+        # Claim lost in a race (or raced past the pre-check): this request's
+        # verdict did not apply — say so instead of pretending success.
+        await db.refresh(run)
+        raise HTTPException(status_code=409, detail=str(ve))
     except Exception:
         logger.exception("Resume execution failed for run %s; returning FAILED run row", run_id)
         await db.refresh(run)
@@ -215,12 +214,25 @@ async def reject_run(
     reason = reject_data.get_reason() if reject_data else "Rejected by user"
 
     executor = WorkflowExecutor()
-    run = await executor.reject(
-        run_id=run_id,
-        reason=reason,
-        db=db,
-        user=current_user
-    )
+    try:
+        run = await executor.reject(
+            run_id=run_id,
+            reason=reason,
+            db=db,
+            user=current_user
+        )
+    except ValueError as ve:
+        # Claim lost in a race (or raced past the pre-check): this request's
+        # rejection did not apply — say so instead of pretending success.
+        await db.refresh(run)
+        raise HTTPException(status_code=409, detail=str(ve))
+    except Exception:
+        # The run row carries the outcome; a mid-flight executor failure lands
+        # here after refresh and reflects the row as it ended up.
+        logger.exception("Rejection execution failed for run %s; returning FAILED run row", run_id)
+        await db.refresh(run)
+        return run
+
     return run
 
 
