@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install dependencies
+        run: uv pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run test suite
+        run: .venv/bin/python -m pytest -q
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install dependencies
+        run: uv pip install -r requirements-dev.txt
+
+      - name: Run lint
+        # Minimal correctness gate (undefined names, syntax errors) — legacy
+        # style noise (format/ordering rules) is deferred to a cleanup pass.
+        run: .venv/bin/ruff check --select E9,F821 app/ tests/
