@@ -103,20 +103,26 @@ class WorkflowExecutor:
             )
             run = result.scalar_one()
         run.input_data = input_data  # Persist inputs so `replay()` can re-execute
+        run_pk = run.id  # Plain-Python PK snapshot, safe to use after any session state change
 
-        # Resolve rule logic from the rule library, then compile to a graph
-        rule_logics = await self._resolve_rule_logics(db, workflow)
-        graph = self.compiler.compile(workflow, rule_logics)
-        
-        # Initialize state
-        initial_state = WorkflowState(
-            input_data=input_data,
-            context={"account_id": account_id, "run_id": str(run.id)}
-        )
-        
         try:
+            # Resolve rule logic from the rule library, then compile to a graph.
+            # Inside the try: resolution/compile failures must mark the run FAILED
+            # like every other execution failure.
+            rule_logics = await self._resolve_rule_logics(db, workflow)
+            graph = self.compiler.compile(workflow, rule_logics)
+
+            # Initialize state
+            initial_state = WorkflowState(
+                input_data=input_data,
+                context={"account_id": account_id, "run_id": str(run.id)}
+            )
+
             # Execute graph asynchronously
             final_state = await graph.ainvoke(initial_state)
+            # Rehydrate into the pydantic WorkflowState: ainvoke returns LangGraph's
+            # dict-like state wrapper, not typed attribute access.
+            final_state = WorkflowState(**final_state)
             
             # Save node executions (one per step, snapshots keyed by step name)
             for i, step in enumerate(sorted(workflow.steps, key=lambda s: s.order_index)):
@@ -160,12 +166,23 @@ class WorkflowExecutor:
             return run
             
         except Exception as e:
-            # Mark run as failed
+            # Mark run as failed. These failures are Python-level (bad input,
+            # missing rule, node error) so the session is still usable; if the
+            # session itself is poisoned by a DB-level error, re-attach by the
+            # snapshotted PK and retry once.
             run.status = RunStatus.FAILED
             run.error_message = str(e)
             run.completed_at = datetime.utcnow()
-            
-            await db.commit()
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                run = await db.get(WorkflowRun, run_pk)
+                if run is not None:
+                    run.status = RunStatus.FAILED
+                    run.error_message = str(e)
+                    run.completed_at = datetime.utcnow()
+                    await db.commit()
             raise
     
     async def replay(

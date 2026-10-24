@@ -19,7 +19,9 @@ class WorkflowState(BaseModel):
     """State object passed between workflow nodes."""
     messages: List[BaseMessage] = []
     input_data: Dict[str, Any] = {}
-    current_output: Dict[str, Any] = {}
+    # Holds whatever the last node produced (AI content string, rule result
+    # scalar, approval dict) — deliberately Any, it serializes into run.output_data.
+    current_output: Any = {}
     context: Dict[str, Any] = {}
     ai_outputs: Dict[str, Any] = {}
     rule_outputs: Dict[str, Any] = {}
@@ -131,7 +133,7 @@ class WorkflowCompiler:
             
             # Store output
             state.ai_outputs[step.name] = result
-            state.current_output = result['content']
+            state.current_output = {"content": result['content']}
             state.context["last_ai_output"] = result['content']
             state.context["retrieved_context"] = context_text
             state.context["last_prompt"] = result['prompt_snapshot']
