@@ -1,4 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker, AsyncEngine
+from sqlalchemy.pool import NullPool
 from typing import AsyncGenerator
 from app.core.config import get_settings
 from app.db.base import Base
@@ -14,10 +15,13 @@ def get_engine() -> AsyncEngine:
     """Get or create the async engine (lazy initialization)."""
     global _engine
     if _engine is None:
+        # NullPool: start a fresh connection per checkout so the engine is safe
+        # to use across separate event loops (pytest + TestClient portals).
         _engine = create_async_engine(
             settings.DATABASE_URL,
             echo=True,
-            future=True
+            future=True,
+            poolclass=NullPool,
         )
     return _engine
 

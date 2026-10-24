@@ -18,12 +18,12 @@ this table.
 | Document upload + RAG ingestion | ✅ Works | ChromaDB + HuggingFace embeddings, per-domain collections |
 | Workflow CRUD (draft/approve/freeze) | ✅ Works | `created_by` is still a placeholder UUID, not the caller |
 | Workflow | ✅ Works | Compiles to a real LangGraph `StateGraph` (AI / rule / approval / conditional nodes) |
-| Execution from the HTTP API | ✅ Works (Phase 3) | `POST /api/v1/runs` drives the executor; LLM output mocked in tests |
-| Replay | ✅ Works (Phase 3) | `POST /api/v1/runs/{id}/replay` re-executes with stored inputs |
+| Execution from the HTTP API | ✅ Works, synchronous | `POST /api/v1/runs` drives the executor; JWT-protected; `input_data` stored for replay; LLM output mocked in tests |
+| Replay | ✅ Works | `POST /api/v1/runs/{id}/replay` re-executes with stored inputs |
 | Intent drafting (`POST /api/v1/intents/draft`) | ⚠️ Requires LLM | Calls OpenRouter; no offline test coverage |
 | RAG context inside AI nodes | ⚠️ Best-effort | Retrieval is attempted when `ENABLE_RAG=true`; empty context on failure |
 | Human approval steps | ⚠️ Simulated | Approval nodes auto-approve with a "system" signature; no pending-state loop yet |
-| Rules resolution | ✅ Works | Rule logic is loaded from `rules`/`rule_versions` tables (was hardcoded before) |
+| Rules resolution | ✅ Works | Rule logic resolved from `rules`/`rule_versions` tables at execution time (was hardcoded before) |
 | Tests | ✅ `pytest -q` | In-process tests (`TestClient` + direct executor), LLM mocked |
 | Config bootstrap | ✅ Works | `.env.example` included |
 | Docker / CI | ❌ None | No Dockerfile, no CI pipeline |

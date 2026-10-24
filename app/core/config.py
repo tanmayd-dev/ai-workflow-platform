@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Vector Store
     CHROMA_DB_DIR: str = "./chroma_db"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Best-effort RAG context retrieval inside AI nodes
+    ENABLE_RAG: bool = True
     
     # Documents Storage
     DOCUMENTS_DIR: str = "./documents"

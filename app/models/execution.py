@@ -35,7 +35,9 @@ class WorkflowRun(Base):
     current_step_index = Column(Integer, default=0)
     
     # Workflow state data
+    input_data = Column(JSON, nullable=True)  # Declared inputs, saved for replay
     state_snapshot = Column(JSON, nullable=True)  # Current graph state
+    replayed_from_run_id = Column(UUID(as_uuid=True), nullable=True)  # Set when this run is a replay
     
     # Audit
     triggered_by = Column(UUID(as_uuid=True), nullable=False)

@@ -136,6 +136,7 @@ class RuleResponse(BaseModel):
 class RunCreate(BaseModel):
     workflow_id: UUID
     account_id: str
+    input_data: Dict[str, Any] = Field(default_factory=dict, description="Input data evaluated by workflow steps")
     trigger_reason: Optional[str] = None
 
 

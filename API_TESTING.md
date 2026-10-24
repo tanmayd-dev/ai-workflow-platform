@@ -19,6 +19,21 @@ API Documentation (Swagger UI): http://localhost:8000/docs
 curl http://localhost:8000/health
 ```
 
+### 1a. Authentication (required for runs)
+
+`POST /api/v1/runs` requires a JWT. Register a user and login first:
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/auth/register" -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "secret", "full_name": "You"}'
+
+curl -X POST "http://localhost:8000/api/v1/auth/login" \
+  -d "username=you@example.com&password=secret"
+# → {"access_token": "...", "token_type": "bearer"}
+```
+
+Use `Authorization: Bearer <token>` on the run endpoints below.
+
 ### 2. Upload Document (Knowledge Base)
 ```bash
 curl -X POST "http://localhost:8000/api/v1/documents/upload" \
@@ -87,12 +102,18 @@ curl -X POST "http://localhost:8000/api/v1/workflows/{workflow_id}/approve"
 ```bash
 curl -X POST "http://localhost:8000/api/v1/runs/" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
   -d '{
     "workflow_id": "{workflow_id}",
     "account_id": "ACC-12345",
+    "input_data": {"transaction_id": "TX-1", "amount": 12000, "risk_score": 0.85},
     "trigger_reason": "High-value transaction detected"
   }'
 ```
+
+The run executes synchronously: the response carries the final `status`
+(`COMPLETED`/`FAILED`). `input_data` is required for meaningful execution —
+domain rules are evaluated against it and it is stored for replay.
 
 ### 7. Get Run Audit Trail
 ```bash
@@ -101,7 +122,8 @@ curl "http://localhost:8000/api/v1/runs/{run_id}/executions"
 
 ### 8. Replay Run
 ```bash
-curl -X POST "http://localhost:8000/api/v1/runs/{run_id}/replay"
+curl -X POST "http://localhost:8000/api/v1/runs/{run_id}/replay" \
+  -H "Authorization: Bearer <token>"
 ```
 
 ## Sample Test Document

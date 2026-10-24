@@ -7,7 +7,7 @@ from app.schemas import IntentRequest, IntentResponse
 from app.services.rag_service import RAGService
 from app.services.llm_service import LLMService
 
-router = APIRouter(prefix="/intents", tags=["intents"])
+router = APIRouter(tags=["intents"])
 
 
 @router.post("/draft", response_model=IntentResponse)

@@ -1,24 +1,41 @@
 """
-Integration tests for the AI-Governed Workflow System.
-Tests the full workflow lifecycle.
+Integration tests for the AI-governed workflow system.
+
+These tests run entirely in-process:
+- API tests go through `fastapi.testclient.TestClient` (no live server needed)
+- executor tests call `WorkflowExecutor` directly
+- LLM calls are mocked by the `mock_llm` fixture in conftest.py
 """
-import asyncio
-import pytest
 from uuid import uuid4
+
+import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.database import get_session_maker
-from app.models.workflow import WorkflowDefinition, WorkflowStep, StepType, WorkflowStatus
-from app.models.user import User, Role
-from app.services.executor import WorkflowExecutor
 from app.core.security import get_password_hash
+from app.main import app
+from app.models.user import User
+from app.models.rule import Rule, RuleVersion
+from app.models.workflow import WorkflowDefinition, WorkflowStep, StepType, WorkflowStatus
+from app.models.execution import RunStatus, WorkflowRun
+from app.services.executor import WorkflowExecutor
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def db_session():
     """Provide a database session for tests."""
     async_session_maker = get_session_maker()
     async with async_session_maker() as session:
         yield session
+
+
+@pytest.fixture
+def client():
+    """In-process HTTP test client (startup event initializes the DB)."""
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
@@ -38,8 +55,36 @@ async def sample_user(db_session: AsyncSession):
 
 
 @pytest.fixture
+async def high_risk_rule(db_session: AsyncSession, sample_user: User):
+    """Seed the rule referenced by sample_workflow steps."""
+    rule = Rule(
+        id=uuid4(),
+        name="high_risk_threshold",
+        description="Escalate high-risk transactions",
+        domain="fraud"
+    )
+    db_session.add(rule)
+    await db_session.flush()
+
+    version = RuleVersion(
+        id=uuid4(),
+        rule_id=rule.id,
+        version_number=1,
+        logic_json={
+            "condition": {"field": "risk_score", "op": ">", "value": 0.8},
+            "result": "ESCALATE"
+        },
+        is_active=True,
+        created_by=sample_user.id
+    )
+    db_session.add(version)
+    await db_session.commit()
+    return (rule, version)
+
+
+@pytest.fixture
 async def sample_workflow(db_session: AsyncSession, sample_user: User):
-    """Create a sample workflow definition."""
+    """Create an APPROVED workflow definition with an AI + rule step pair."""
     workflow = WorkflowDefinition(
         id=uuid4(),
         name="Test Fraud Workflow",
@@ -53,8 +98,7 @@ async def sample_workflow(db_session: AsyncSession, sample_user: User):
     )
     db_session.add(workflow)
     await db_session.flush()
-    
-    # Add steps
+
     steps = [
         WorkflowStep(
             id=uuid4(),
@@ -80,124 +124,163 @@ async def sample_workflow(db_session: AsyncSession, sample_user: User):
             }
         )
     ]
-    
+
     for step in steps:
         db_session.add(step)
-    
+
     await db_session.commit()
     await db_session.refresh(workflow)
     return workflow
 
 
+def test_authentication_flow(client):
+    """Register, login, and access a protected endpoint — all in-process."""
+    register_data = {
+        "email": f"test_{uuid4()}@example.com",
+        "password": "testpass123",
+        "full_name": "Integration Test User"
+    }
+
+    response = client.post("/api/v1/auth/register", json=register_data)
+    assert response.status_code == 201, response.text
+    assert response.json()["email"] == register_data["email"]
+
+    login = client.post("/api/v1/auth/login", data={
+        "username": register_data["email"],
+        "password": register_data["password"],
+    })
+    assert login.status_code == 200, login.text
+    assert "access_token" in login.json()
+
+    me = client.get("/api/v1/auth/me", headers={
+        "Authorization": f"Bearer {login.json()['access_token']}"
+    })
+    assert me.status_code == 200, me.text
+    assert me.json()["email"] == register_data["email"]
+
+
 @pytest.mark.asyncio
-async def test_workflow_execution(db_session: AsyncSession, sample_workflow: WorkflowDefinition):
-    """Test full workflow execution."""
+async def test_workflow_execution(db_session: AsyncSession, sample_workflow: WorkflowDefinition, mock_llm):
+    """Direct executor test: run completes and persists node executions."""
     executor = WorkflowExecutor()
-    
+
     input_data = {
         "transaction_id": "TX123",
         "amount": 50000,
         "risk_score": 0.85
     }
-    
-    # Execute workflow
+
     run = await executor.execute(
         workflow_id=sample_workflow.id,
         input_data=input_data,
         account_id="ACC123",
         db=db_session
     )
-    
-    # Assertions
-    assert run is not None
+
+    assert run.id is not None
     assert run.workflow_id == sample_workflow.id
     assert run.account_id == "ACC123"
-    assert run.status is not None
-    print(f"✓ Workflow executed successfully: Run ID {run.id}")
+    assert run.status == RunStatus.COMPLETED, f"run failed: {run.error_message}"
+    assert run.input_data == input_data
 
 
 @pytest.mark.asyncio
-async def test_workflow_replay(db_session: AsyncSession, sample_workflow: WorkflowDefinition):
-    """Test workflow replay functionality."""
+async def test_workflow_replay(db_session: AsyncSession, sample_workflow: WorkflowDefinition, mock_llm):
+    """Direct executor test: replay re-executes with the stored inputs."""
     executor = WorkflowExecutor()
-    
+
     input_data = {
         "transaction_id": "TX456",
         "amount": 75000,
         "risk_score": 0.92
     }
-    
-    # Original execution
+
     original_run = await executor.execute(
         workflow_id=sample_workflow.id,
         input_data=input_data,
         account_id="ACC456",
         db=db_session
     )
-    
-    # Replay
+    assert original_run.status == RunStatus.COMPLETED, original_run.error_message
+
     replay_run = await executor.replay(
         original_run_id=original_run.id,
         db=db_session
     )
-    
-    # Assertions
-    assert replay_run is not None
+
     assert replay_run.id != original_run.id
-    assert replay_run.replayed_from_run_id == original_run.id
     assert replay_run.input_data == original_run.input_data
-    print(f"✓ Workflow replayed successfully: Replay Run ID {replay_run.id}")
+    assert replay_run.status == RunStatus.COMPLETED, replay_run.error_message
+
+    # The replay linkage must be persisted, not just set on the in-memory object
+    from sqlalchemy import select
+    result = await db_session.execute(
+        select(WorkflowRun).where(WorkflowRun.id == replay_run.id)
+    )
+    persisted = result.scalar_one()
+    assert persisted.replayed_from_run_id == original_run.id
 
 
-@pytest.mark.asyncio
-async def test_authentication_flow():
-    """Test user registration and login flow."""
-    import requests
-    
-    base_url = "http://127.0.0.1:8000/api/v1"
-    
-    # Register
-    register_data = {
-        "email": f"test_{uuid4()}@example.com",
-        "password": "testpass123",
-        "full_name": "Integration Test User"
-    }
-    
-    response = requests.post(f"{base_url}/auth/register", json=register_data)
-    assert response.status_code == 201
-    user_data = response.json()
-    assert user_data["email"] == register_data["email"]
-    
-    # Login
-    login_data = {
-        "username": register_data["email"],
-        "password": register_data["password"]
-    }
-    
-    response = requests.post(f"{base_url}/auth/login", data=login_data)
-    assert response.status_code == 200
-    token_data = response.json()
-    assert "access_token" in token_data
-    
-    # Access protected endpoint
-    headers = {"Authorization": f"Bearer {token_data['access_token']}"}
-    response = requests.get(f"{base_url}/auth/me", headers=headers)
-    assert response.status_code == 200
-    profile = response.json()
-    assert profile["email"] == register_data["email"]
-    
-    print(f"✓ Authentication flow completed successfully")
+def test_run_endpoint_executes_workflow(client, sample_workflow, high_risk_rule, mock_llm):
+    """POST /api/v1/runs drives the executor end-to-end (sync execution)."""
+    email = f"runner_{uuid4()}@example.com"
+
+    register = client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Run User"
+    })
+    assert register.status_code == 201, register.text
+
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    input_data = {"transaction_id": "TX789", "amount": 90000, "risk_score": 0.91}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(sample_workflow.id),
+        "account_id": "ACC789",
+        "input_data": input_data,
+        "trigger_reason": "High-value transaction detected"
+    })
+    assert created.status_code == 201, created.text
+    run = created.json()
+    assert run["status"] == RunStatus.COMPLETED.value
+
+    # Unauthenticated runs are rejected
+    denied = client.post("/api/v1/runs/", json={
+        "workflow_id": str(sample_workflow.id),
+        "account_id": "ACC789",
+    })
+    assert denied.status_code == 401
+
+    # Audit trail: one node execution per step, inputs recorded
+    executions = client.get(f"/api/v1/runs/{run['id']}/executions")
+    assert executions.status_code == 200, executions.text
+    assert len(executions.json()) == 2
+
+    # Replay endpoint re-executes with the stored inputs
+    replay = client.post(f"/api/v1/runs/{run['id']}/replay", headers=headers)
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["status"] == RunStatus.COMPLETED.value
 
 
-if __name__ == "__main__":
-    # Run tests manually
-    print("Running Integration Tests...\n")
-    
-    print("=" * 60)
-    print("TEST: Authentication Flow")
-    print("=" * 60)
-    asyncio.run(test_authentication_flow())
-    
-    print("\n" + "=" * 60)
-    print("All integration tests would run with: pytest tests/test_integration.py")
-    print("=" * 60)
+def test_run_endpoint_fails_without_rule(client, sample_workflow, mock_llm):
+    """Rule references that do not exist in the DB fail loudly, not silently."""
+    email = f"runner_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Run User"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(sample_workflow.id),
+        "account_id": "ACC999",
+        "input_data": {"risk_score": 0.5},
+    })
+    assert created.status_code == 201, created.text
+    assert created.json()["status"] == RunStatus.FAILED.value
