@@ -818,7 +818,7 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
 
     # Rule is no longer accessible
     assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
-def test_rejected_run_error_message_persists_in_database(client, approval_workflow, high_risk_rule, mock_llm):
+async def test_rejected_run_error_message_persists_in_database(client, approval_workflow, high_risk_rule, mock_llm):
     """
     The rejection reason must live in the committed workflow_runs row
     (read through an independent session), not merely in request-scoped
@@ -857,9 +857,50 @@ def test_rejected_run_error_message_persists_in_database(client, approval_workfl
                 select(WorkflowRun).where(WorkflowRun.id == UUID(run_id))
             )).scalar_one()
 
-    row = asyncio.run(_read_committed_row())
+    row = await _read_committed_row()
     assert row.status == RunStatus.FAILED
     assert row.error_message == rejection_reason
+
+
+def test_racing_verdict_conflict_returns_409(client, approval_workflow, high_risk_rule, mock_llm, monkeypatch):
+    """
+    A verdict request whose CAS claim loses (simulated) must answer 409 —
+    NOT 200 with the winner's row — because that approve/rejection did not
+    actually apply.
+    """
+    email = f"race409_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Race 409"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": "ACC_RACE_409",
+        "input_data": {"risk_score": 0.9},
+    })
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    assert created.json()["status"] == RunStatus.PAUSED.value
+
+    async def lost_claim_resume(self, run_id, verdict, db):
+        raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
+
+    async def lost_claim_reject(self, run_id, reason, db, user=None):
+        raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
+
+    monkeypatch.setattr(WorkflowExecutor, "resume", lost_claim_resume)
+    conflict = client.post(f"/api/v1/runs/{run_id}/approve", headers=headers)
+    assert conflict.status_code == 409, conflict.text
+    assert "not in PAUSED" in conflict.text
+
+    monkeypatch.setattr(WorkflowExecutor, "reject", lost_claim_reject)
+    conflict = client.post(f"/api/v1/runs/{run_id}/reject", headers=headers)
+    assert conflict.status_code == 409, conflict.text
+    assert "not in PAUSED" in conflict.text
 
 
 async def test_concurrent_approves_exactly_one_wins(db_session, approval_workflow, high_risk_rule, mock_llm):

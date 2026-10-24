@@ -170,6 +170,11 @@ async def approve_run(
             verdict=verdict,
             db=db
         )
+    except ValueError as ve:
+        # Claim lost in a race (or raced past the pre-check): this request's
+        # verdict did not apply — say so instead of pretending success.
+        await db.refresh(run)
+        raise HTTPException(status_code=409, detail=str(ve))
     except Exception:
         logger.exception("Resume execution failed for run %s; returning FAILED run row", run_id)
         await db.refresh(run)
@@ -216,9 +221,14 @@ async def reject_run(
             db=db,
             user=current_user
         )
+    except ValueError as ve:
+        # Claim lost in a race (or raced past the pre-check): this request's
+        # rejection did not apply — say so instead of pretending success.
+        await db.refresh(run)
+        raise HTTPException(status_code=409, detail=str(ve))
     except Exception:
-        # Same policy as approve: the run row carries the outcome; a racing
-        # loser lands here after refresh and simply reflects the winner's row.
+        # The run row carries the outcome; a mid-flight executor failure lands
+        # here after refresh and reflects the row as it ended up.
         logger.exception("Rejection execution failed for run %s; returning FAILED run row", run_id)
         await db.refresh(run)
         return run

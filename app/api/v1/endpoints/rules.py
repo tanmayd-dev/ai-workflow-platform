@@ -229,6 +229,7 @@ async def delete_rule(
         select(WorkflowDefinition.id, WorkflowDefinition.name, WorkflowDefinition.status)
         .join(WorkflowStep, WorkflowStep.workflow_id == WorkflowDefinition.id)
         .where(WorkflowStep.config_json["rule_id"].as_string() == rule.name)
+        .distinct()  # a workflow with several referencing steps must appear once
         .limit(20)
     )
     refs = referencing.all()

@@ -278,7 +278,9 @@ class WorkflowExecutor:
             .values(status=RunStatus.RUNNING)
         )
         result = await db.execute(
-            select(WorkflowRun).where(WorkflowRun.id == run_id)
+            select(WorkflowRun)
+            .where(WorkflowRun.id == run_id)
+            .execution_options(populate_existing=True)  # fresh attributes even for a stale identity map
         )
         run = result.scalar_one_or_none()
         if claim.rowcount == 0 or not run:
@@ -493,7 +495,9 @@ class WorkflowExecutor:
             .values(status=RunStatus.FAILED)
         )
         result = await db.execute(
-            select(WorkflowRun).where(WorkflowRun.id == run_id)
+            select(WorkflowRun)
+            .where(WorkflowRun.id == run_id)
+            .execution_options(populate_existing=True)  # fresh attributes even for a stale identity map
         )
         run = result.scalar_one_or_none()
         if claim.rowcount == 0 or not run:
@@ -534,7 +538,6 @@ class WorkflowExecutor:
 
             await db.commit()
             await db.refresh(run)
-            run.error_message = reason
             return run
         except Exception as e:
             run.status = RunStatus.FAILED
