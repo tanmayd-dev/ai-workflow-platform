@@ -103,7 +103,7 @@ app/
   2 seeders); consolidation is pending.
 - Runs execute synchronously inside the HTTP request; long executions belong in
   a background task/queue.
-- No Docker, CI, or LICENSE tracking.
+- No CI tracking.
 
 ## License
 
