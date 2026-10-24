@@ -1,0 +1,4 @@
+- `seed.py`: Seed initial roles and admin user for authentication and testing — `python scripts/seed.py`
+- `demo.py`: End-to-end demonstration of document upload, AI intent drafting, workflow creation, and approval — `python scripts/demo.py`
+- `demo_all_nodes.py`: Demonstrate workflow with all node types (AI_ANALYSIS, DOMAIN_RULE, HUMAN_APPROVAL) — `python scripts/demo_all_nodes.py`
+- `demo_intent_workflow.py`: Demonstrate policy document upload and AI workflow generation from intent — `python scripts/demo_intent_workflow.py`

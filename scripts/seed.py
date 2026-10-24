@@ -1,6 +1,12 @@
 """
 Simplified seed data creation - minimal version to test.
 """
+import sys
+import os
+
+# Add repository root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
