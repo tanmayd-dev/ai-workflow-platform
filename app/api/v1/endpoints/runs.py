@@ -1,10 +1,11 @@
 """Workflow execution endpoints."""
 import logging
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
-from typing import List
+from typing import List, Optional
 from uuid import uuid4, UUID
 
 from app.core.database import get_db
@@ -12,7 +13,13 @@ from app.api.v1.endpoints.auth import get_current_active_user
 from app.models.user import User
 from app.models.workflow import WorkflowDefinition, WorkflowStatus
 from app.models.execution import WorkflowRun, NodeExecution, RunStatus
-from app.schemas import RunCreate, RunResponse, NodeExecutionResponse
+from app.schemas import (
+    RunCreate,
+    RunResponse,
+    NodeExecutionResponse,
+    RunApprovalRequest,
+    RunRejectRequest,
+)
 from app.services.executor import WorkflowExecutor
 
 router = APIRouter()
@@ -116,6 +123,104 @@ async def get_run(
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    if run.state_snapshot and isinstance(run.state_snapshot, dict):
+        if "rejection_reason" in run.state_snapshot and not getattr(run, "error_message", None):
+            run.error_message = run.state_snapshot["rejection_reason"]
+        elif "error_message" in run.state_snapshot and not getattr(run, "error_message", None):
+            run.error_message = run.state_snapshot["error_message"]
+
+    return run
+
+
+@router.post("/{run_id}/approve", response_model=RunResponse)
+async def approve_run(
+    run_id: UUID,
+    approval_data: Optional[RunApprovalRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Approve a paused workflow run and resume execution from the approval node.
+
+    Constraints:
+    - Run must exist (404)
+    - Run must be in PAUSED status (400)
+    """
+    result = await db.execute(
+        select(WorkflowRun).where(WorkflowRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != RunStatus.PAUSED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} is not in PAUSED status (current: {run.status})"
+        )
+
+    notes = approval_data.notes if approval_data and approval_data.notes else "Approved by human reviewer"
+    approver = getattr(current_user, "email", str(current_user.id))
+    verdict = {
+        "approved": True,
+        "approver": approver,
+        "notes": notes,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    executor = WorkflowExecutor()
+    try:
+        run = await executor.resume(
+            run_id=run_id,
+            verdict=verdict,
+            db=db
+        )
+    except Exception:
+        logger.exception("Resume execution failed for run %s; returning FAILED run row", run_id)
+        await db.refresh(run)
+        return run
+
+    return run
+
+
+@router.post("/{run_id}/reject", response_model=RunResponse)
+async def reject_run(
+    run_id: UUID,
+    reject_data: Optional[RunRejectRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Reject a paused workflow run, marking it FAILED with a rejection reason.
+
+    Constraints:
+    - Run must exist (404)
+    - Run must be in PAUSED status (400)
+    """
+    result = await db.execute(
+        select(WorkflowRun).where(WorkflowRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != RunStatus.PAUSED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run {run_id} is not in PAUSED status (current: {run.status})"
+        )
+
+    reason = reject_data.get_reason() if reject_data else "Rejected by user"
+
+    executor = WorkflowExecutor()
+    run = await executor.reject(
+        run_id=run_id,
+        reason=reason,
+        db=db,
+        user=current_user
+    )
     return run
 
 

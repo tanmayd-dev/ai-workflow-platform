@@ -95,8 +95,7 @@ app/
 
 ## Known limitations / next steps
 
-- Human-approval nodes auto-approve — a real pending-state + approve/reject
-  endpoint loop is the natural next feature.
+- Human-approval nodes pause execution in a real pending state and resume via POST /runs/{id}/approve or fail via POST /runs/{id}/reject.
 - Auth is enforced on `/runs` plus workflow draft/approve and document upload;
   remaining endpoints gain auth as they are added (rules next).
 - The root-level scripts duplicate each other (4 API smoke scripts, 3 demos,

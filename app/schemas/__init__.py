@@ -143,6 +143,18 @@ class RunCreate(BaseModel):
     trigger_reason: Optional[str] = None
 
 
+class RunApprovalRequest(BaseModel):
+    notes: Optional[str] = Field(default=None, description="Optional notes from human approver")
+
+
+class RunRejectRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, description="Reason for rejection")
+    rejection_reason: Optional[str] = Field(default=None, description="Alias for reason")
+
+    def get_reason(self) -> str:
+        return self.reason or self.rejection_reason or "Rejected by user"
+
+
 class RunResponse(BaseModel):
     id: UUID
     workflow_id: UUID
@@ -151,6 +163,7 @@ class RunResponse(BaseModel):
     current_step_index: int
     started_at: datetime
     completed_at: Optional[datetime]
+    error_message: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -166,6 +179,7 @@ class NodeExecutionResponse(BaseModel):
     output_snapshot: Optional[Any]
     started_at: datetime
     completed_at: Optional[datetime]
+    error_message: Optional[str] = None
     
     class Config:
         from_attributes = True
