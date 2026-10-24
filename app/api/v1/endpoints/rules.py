@@ -3,8 +3,9 @@ import logging
 from typing import List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -12,6 +13,7 @@ from app.api.v1.endpoints.auth import get_current_active_user
 from app.core.database import get_db
 from app.models.rule import Rule, RuleVersion
 from app.models.user import User
+from app.models.workflow import WorkflowDefinition, WorkflowStep
 from app.schemas import (
     RuleCreate,
     RuleResponse,
@@ -68,7 +70,16 @@ async def create_rule(
     )
     db.add(version)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Race-safe duplicate-name rejection: the Rule.name unique constraint
+        # is the source of truth if two creators pass the select above.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Rule with name '{rule_data.name}' already exists (name is unique globally)",
+        )
 
     # Reload rule with its versions eagerly loaded
     result = await db.execute(
@@ -169,7 +180,16 @@ async def create_rule_version(
     )
     db.add(new_version)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # The (rule_id, version_number) unique constraint / one-active partial
+        # index is the race-safe source of truth for versioning.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Version {next_version} conflicts for rule '{rule.name}' (unique per rule; one active version allowed)",
+        )
     await db.refresh(new_version)
     return new_version
 
@@ -177,6 +197,7 @@ async def create_rule_version(
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_rule(
     rule_id: UUID,
+    force: bool = Query(default=False, description="Delete even if workflows still reference the rule"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
@@ -186,6 +207,11 @@ async def delete_rule(
     Explicit deletion strategy:
     Hard DELETE of the Rule record, cascading to all associated RuleVersion records.
     Requires authenticated user (JWT).
+
+    Guarded against breaking referencing workflows: a rule whose name is used by a
+    workflow step's config_json.rule_id cannot be deleted unless ?force=true is
+    passed. Forced deletion is allowed but the referencing workflows' runs will
+    fail (rule resolution error) until their steps are updated.
     """
     result = await db.execute(
         select(Rule)
@@ -197,6 +223,31 @@ async def delete_rule(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Rule with id '{rule_id}' not found",
+        )
+
+    referencing = await db.execute(
+        select(WorkflowDefinition.id, WorkflowDefinition.name, WorkflowDefinition.status)
+        .join(WorkflowStep, WorkflowStep.workflow_id == WorkflowDefinition.id)
+        .where(WorkflowStep.config_json["rule_id"].as_string() == rule.name)
+        .limit(20)
+    )
+    refs = referencing.all()
+
+    if refs and not force:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": f"Rule '{rule.name}' is still referenced by workflows and cannot be deleted",
+                "referencing_workflows": [
+                    {
+                        "id": str(r.id),
+                        "name": r.name,
+                        "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+                    }
+                    for r in refs
+                ],
+                "hint": "Pass ?force=true to delete anyway; runs of those workflows will fail until their rule_id is updated.",
+            },
         )
 
     await db.delete(rule)

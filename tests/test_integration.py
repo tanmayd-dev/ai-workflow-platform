@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_maker
@@ -808,8 +809,11 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
     execs_v2 = client.get(f"/api/v1/runs/{run_v2_body['id']}/executions").json()
     assert execs_v2[1]["output_snapshot"] == "FLAG_OVER_500_V2"
 
-    # 7. Delete rule via DELETE /rules/{rule_id}
-    del_resp = client.delete(f"/api/v1/rules/{rule_id}", headers=headers)
+    # 7. Delete rule via DELETE /rules/{rule_id} — still referenced by the
+    # workflow above (left in place deliberately), so an unforced delete must
+    # be refused with 409; the forced delete proceeds and the rule is gone.
+    assert client.delete(f"/api/v1/rules/{rule_id}", headers=headers).status_code == 409
+    del_resp = client.delete(f"/api/v1/rules/{rule_id}?force=true", headers=headers)
     assert del_resp.status_code == 204
 
     # Rule is no longer accessible
@@ -905,3 +909,128 @@ async def test_concurrent_approves_exactly_one_wins(db_session, approval_workflo
         )).scalars().all()
         assert len(execs) == 3
         assert all(e.status == NodeStatus.COMPLETED for e in execs)
+
+
+def test_delete_referenced_rule_guarded_by_409_and_force(client, mock_llm):
+    """
+    A rule referenced by an approved workflow cannot be silently deleted:
+    - DELETE /rules/{id}            -> 409, detail lists the referencing workflow
+    - DELETE still possible with ?force=true -> 204, rule 404 afterwards, and a
+      run of the referencing workflow then fails with a resolution error
+      (the documented blast radius).
+    """
+    email = f"guard_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Guard Tester"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    rule_name = f"guarded_rule_{uuid4().hex[:8]}"
+    create = client.post("/api/v1/rules", headers=headers, json={
+        "name": rule_name,
+        "domain": "fraud",
+        "logic_json": {"condition": {"field": "amount", "op": ">", "value": 100}, "result": "OK"}
+    })
+    assert create.status_code == 201, create.text
+    rule_id = create.json()["id"]
+
+    wf = client.post("/api/v1/workflows/draft", headers=headers, json={
+        "name": f"Guard WF {rule_name}",
+        "description": "references the guarded rule",
+        "domain": "fraud",
+        "steps": [{
+            "order_index": 0,
+            "step_type": "DOMAIN_RULE",
+            "name": "Check",
+            "description": "uses guarded rule",
+            "config_json": {"rule_id": rule_name}
+        }]
+    })
+    assert wf.status_code == 201, wf.text
+    wf_id = wf.json()["id"]
+    assert client.post(f"/api/v1/workflows/{wf_id}/approve", headers=headers).status_code == 200
+
+    # Unguarded delete -> 409 naming the referencing workflow; rule survives
+    guarded = client.delete(f"/api/v1/rules/{rule_id}", headers=headers)
+    assert guarded.status_code == 409, guarded.text
+    assert str(wf_id) in guarded.text
+    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 200
+
+    # Forced delete -> 204, rule gone, referencing workflow's next run fails
+    forced = client.delete(f"/api/v1/rules/{rule_id}?force=true", headers=headers)
+    assert forced.status_code == 204, forced.text
+    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
+
+    run = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": wf_id,
+        "account_id": "ACC_FORCE_DEL",
+        "input_data": {"amount": 500}
+    })
+    assert run.status_code == 201, run.text
+    body = run.json()
+    assert body["status"] == RunStatus.FAILED.value
+    assert rule_name in body["error_message"]
+
+
+async def test_rule_version_constraints_enforced(db_session, sample_user):
+    """
+    DB-level integrity from the model constraints (mirrored by migration
+    d7e2b4f9c1a6): duplicate (rule_id, version_number) rows and a second
+    ACTIVE version for the same rule are both rejected by the database.
+    """
+    from sqlalchemy.exc import IntegrityError as IE
+
+    rule = Rule(
+        id=uuid4(),
+        name=f"constraint_rule_{uuid4().hex[:8]}",
+        description=None,
+        domain="fraud"
+    )
+    db_session.add(rule)
+    await db_session.flush()
+
+    v1 = RuleVersion(
+        id=uuid4(),
+        rule_id=rule.id,
+        version_number=1,
+        logic_json={"result": "V1"},
+        is_active=True,
+        created_by=sample_user.id
+    )
+    db_session.add(v1)
+    await db_session.commit()
+
+    session_maker = get_session_maker()
+
+    # 1. Same version_number twice -> violates uq_rule_version_number
+    async with session_maker() as s:
+        dup = RuleVersion(
+            id=uuid4(),
+            rule_id=rule.id,
+            version_number=1,
+            logic_json={"result": "dup"},
+            is_active=True,
+            created_by=sample_user.id
+        )
+        s.add(dup)
+        with pytest.raises(IE):
+            await s.commit()
+        await s.rollback()
+
+    # 2. Second ACTIVE version for the same rule -> violates uq_rule_active_version
+    async with session_maker() as s:
+        second_active = RuleVersion(
+            id=uuid4(),
+            rule_id=rule.id,
+            version_number=2,
+            logic_json={"result": "two actives"},
+            is_active=True,
+            created_by=sample_user.id
+        )
+        s.add(second_active)
+        with pytest.raises(IE):
+            await s.commit()
+        await s.rollback()

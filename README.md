@@ -96,8 +96,8 @@ app/
 ## Known limitations / next steps
 
 - Human-approval nodes pause execution in a real pending state and resume via POST /runs/{id}/approve or fail via POST /runs/{id}/reject.
-- Auth is enforced on `/runs`, `/rules` (CRUD API implemented), plus workflow draft/approve and document upload;
-  remaining endpoints gain auth as they are added.
+- Auth is enforced on the mutating endpoints of `/runs` and `/rules` (CRUD API implemented), plus workflow draft/approve
+  and document upload; reads are currently public repo-wide and gain auth when a real authorization model lands.
 - The root-level scripts duplicate each other (4 API smoke scripts, 3 demos,
   2 seeders); consolidation is pending.
 - Runs execute synchronously inside the HTTP request; long executions belong in
