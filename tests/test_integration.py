@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_maker
@@ -590,6 +591,233 @@ def test_approval_workflow_missing_rule_fails(client, approval_workflow, mock_ll
     assert "high_risk_threshold" in run_body["error_message"]
 
 
+def test_rules_api_auth_and_duplicate_validation(client):
+    """
+    Test auth constraints and duplicate validations on Rules API:
+    - Mutation endpoints reject unauthenticated requests with 401
+    - Duplicate rule name returns 409 Conflict
+    """
+    rule_name = f"rule_{uuid4().hex[:8]}"
+
+    # 1. Unauthenticated mutations -> 401
+    unauth_create = client.post("/api/v1/rules", json={
+        "name": rule_name,
+        "domain": "fraud",
+        "logic_json": {"condition": {"field": "amount", "op": ">", "value": 100}, "result": "FLAG"}
+    })
+    assert unauth_create.status_code == 401, unauth_create.text
+
+    unauth_version = client.post(f"/api/v1/rules/{uuid4()}/versions", json={
+        "logic_json": {"result": "FLAG_V2"}
+    })
+    assert unauth_version.status_code == 401, unauth_version.text
+
+    unauth_delete = client.delete(f"/api/v1/rules/{uuid4()}")
+    assert unauth_delete.status_code == 401, unauth_delete.text
+
+    # 2. Register & login
+    email = f"rule_auth_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Auth Tester"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # 3. Create initial rule -> 201
+    created = client.post("/api/v1/rules", headers=headers, json={
+        "name": rule_name,
+        "description": "Initial rule for validation test",
+        "domain": "fraud",
+        "logic_json": {"condition": {"field": "amount", "op": ">", "value": 100}, "result": "FLAG"}
+    })
+    assert created.status_code == 201, created.text
+
+    # 4. Duplicate name in same domain -> 409
+    dup = client.post("/api/v1/rules", headers=headers, json={
+        "name": rule_name,
+        "description": "Duplicate name attempt",
+        "domain": "fraud",
+        "logic_json": {"result": "DUP"}
+    })
+    assert dup.status_code == 409, dup.text
+
+
+def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
+    """
+    End-to-end behavioral test:
+    - Register + login
+    - Create a rule via POST /rules (v1, active)
+    - Query rule via GET /rules and GET /rules/{rule_id} (includes versions)
+    - Build workflow whose DOMAIN_RULE step's config_json.rule_id references the rule NAME
+    - Approve the workflow
+    - Run via POST /runs with matching input -> run uses API-created rule's logic and COMPLETES
+    - Add a new version v2 via POST /rules/{rule_id}/versions -> v1 flips to inactive, v2 is active
+    - Run workflow again -> run uses v2 logic and COMPLETES with new result
+    - Delete rule via DELETE /rules/{rule_id} -> returns 204, rule gone (404)
+    """
+    email = f"rule_exec_{uuid4()}@example.com"
+    reg_resp = client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Rule Exec User"
+    })
+    user_id = reg_resp.json()["id"]
+
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    # 1. Create rule via API
+    rule_name = f"fraud_tx_threshold_{uuid4().hex[:8]}"
+    rule_data = {
+        "name": rule_name,
+        "description": "Flag transactions exceeding $500",
+        "domain": "fraud",
+        "logic_json": {
+            "condition": {"field": "amount", "op": ">", "value": 500},
+            "result": "FLAG_OVER_500"
+        }
+    }
+    create_resp = client.post("/api/v1/rules", headers=headers, json=rule_data)
+    assert create_resp.status_code == 201, create_resp.text
+    rule_body = create_resp.json()
+    rule_id = rule_body["id"]
+
+    assert rule_body["name"] == rule_name
+    assert rule_body["domain"] == "fraud"
+    assert len(rule_body["versions"]) == 1
+    v1 = rule_body["versions"][0]
+    assert v1["version_number"] == 1
+    assert v1["is_active"] is True
+    assert v1["created_by"] == user_id
+    assert v1["logic_json"] == rule_data["logic_json"]
+
+    # Also verify rule creation works when providing initial_logic
+    alt_rule_name = f"alt_rule_{uuid4().hex[:8]}"
+    alt_create = client.post("/api/v1/rules", headers=headers, json={
+        "name": alt_rule_name,
+        "domain": "fraud",
+        "initial_logic": {"condition": {"field": "amount", "op": ">", "value": 100}, "result": "OK"}
+    })
+    assert alt_create.status_code == 201, alt_create.text
+    assert len(alt_create.json()["versions"]) == 1
+
+    # 2. GET /rules and GET /rules/{rule_id} include versions
+    get_resp = client.get(f"/api/v1/rules/{rule_id}")
+    assert get_resp.status_code == 200, get_resp.text
+    assert get_resp.json()["id"] == rule_id
+    assert len(get_resp.json()["versions"]) == 1
+
+    list_resp = client.get("/api/v1/rules?domain=fraud")
+    assert list_resp.status_code == 200, list_resp.text
+    matching_rules = [r for r in list_resp.json() if r["id"] == rule_id]
+    assert len(matching_rules) == 1
+    assert len(matching_rules[0]["versions"]) == 1
+
+    # 3. Build a workflow whose DOMAIN_RULE step's config_json.rule_id references rule NAME
+    wf_create = client.post("/api/v1/workflows/draft", headers=headers, json={
+        "name": f"Workflow with Rule {rule_name}",
+        "description": "Evaluates custom rule created via API",
+        "domain": "fraud",
+        "steps": [
+            {
+                "order_index": 0,
+                "step_type": "AI_ANALYSIS",
+                "name": "Risk Analysis",
+                "description": "AI analyzes transaction",
+                "config_json": {
+                    "prompt_template": "Analyze transaction risk"
+                }
+            },
+            {
+                "order_index": 1,
+                "step_type": "DOMAIN_RULE",
+                "name": "Threshold Check",
+                "description": "Apply custom amount threshold rule",
+                "config_json": {
+                    "rule_id": rule_name
+                }
+            }
+        ]
+    })
+    assert wf_create.status_code == 201, wf_create.text
+    wf_id = wf_create.json()["id"]
+
+    # Approve workflow
+    approve_resp = client.post(f"/api/v1/workflows/{wf_id}/approve", headers=headers)
+    assert approve_resp.status_code == 200, approve_resp.text
+
+    # 4. Run via POST /runs with matching input — must use API-created rule's logic and COMPLETE
+    run_resp = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": wf_id,
+        "account_id": "ACC_TEST_RULE_1",
+        "input_data": {"amount": 750},
+        "trigger_reason": "Testing API-created rule"
+    })
+    assert run_resp.status_code == 201, run_resp.text
+    run_body = run_resp.json()
+    assert run_body["status"] == RunStatus.COMPLETED.value
+
+    # Verify node execution recorded rule output
+    execs_resp = client.get(f"/api/v1/runs/{run_body['id']}/executions")
+    assert execs_resp.status_code == 200, execs_resp.text
+    execs = execs_resp.json()
+    assert len(execs) == 2
+    assert execs[0]["node_type"] == StepType.AI_ANALYSIS.value
+    assert execs[0]["status"] == NodeStatus.COMPLETED.value
+    assert execs[1]["node_type"] == StepType.DOMAIN_RULE.value
+    assert execs[1]["status"] == NodeStatus.COMPLETED.value
+    assert execs[1]["output_snapshot"] == "FLAG_OVER_500"
+
+    # 5. Add a new version via POST /rules/{rule_id}/versions
+    v2_logic = {
+        "condition": {"field": "amount", "op": ">", "value": 500},
+        "result": "FLAG_OVER_500_V2"
+    }
+    v2_resp = client.post(
+        f"/api/v1/rules/{rule_id}/versions",
+        headers=headers,
+        json={"logic_json": v2_logic}
+    )
+    assert v2_resp.status_code == 201, v2_resp.text
+    v2_body = v2_resp.json()
+    assert v2_body["version_number"] == 2
+    assert v2_body["is_active"] is True
+    assert v2_body["rule_id"] == rule_id
+    assert v2_body["created_by"] == user_id
+
+    # Verify older version is flipped to is_active=False
+    updated_rule = client.get(f"/api/v1/rules/{rule_id}").json()
+    assert len(updated_rule["versions"]) == 2
+    v2_item = next(v for v in updated_rule["versions"] if v["version_number"] == 2)
+    v1_item = next(v for v in updated_rule["versions"] if v["version_number"] == 1)
+    assert v2_item["is_active"] is True
+    assert v1_item["is_active"] is False
+
+    # 6. Run workflow again — executor resolves latest active version (v2) and COMPLETES
+    run_v2_resp = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": wf_id,
+        "account_id": "ACC_TEST_RULE_2",
+        "input_data": {"amount": 750},
+        "trigger_reason": "Testing v2 rule resolution"
+    })
+    assert run_v2_resp.status_code == 201, run_v2_resp.text
+    run_v2_body = run_v2_resp.json()
+    assert run_v2_body["status"] == RunStatus.COMPLETED.value
+
+    execs_v2 = client.get(f"/api/v1/runs/{run_v2_body['id']}/executions").json()
+    assert execs_v2[1]["output_snapshot"] == "FLAG_OVER_500_V2"
+
+    # 7. Delete rule via DELETE /rules/{rule_id} — still referenced by the
+    # workflow above (left in place deliberately), so an unforced delete must
+    # be refused with 409; the forced delete proceeds and the rule is gone.
+    assert client.delete(f"/api/v1/rules/{rule_id}", headers=headers).status_code == 409
+    del_resp = client.delete(f"/api/v1/rules/{rule_id}?force=true", headers=headers)
+    assert del_resp.status_code == 204
+
+    # Rule is no longer accessible
+    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
 async def test_rejected_run_error_message_persists_in_database(client, approval_workflow, high_risk_rule, mock_llm):
     """
     The rejection reason must live in the committed workflow_runs row
@@ -722,3 +950,128 @@ async def test_concurrent_approves_exactly_one_wins(db_session, approval_workflo
         )).scalars().all()
         assert len(execs) == 3
         assert all(e.status == NodeStatus.COMPLETED for e in execs)
+
+
+def test_delete_referenced_rule_guarded_by_409_and_force(client, mock_llm):
+    """
+    A rule referenced by an approved workflow cannot be silently deleted:
+    - DELETE /rules/{id}            -> 409, detail lists the referencing workflow
+    - DELETE still possible with ?force=true -> 204, rule 404 afterwards, and a
+      run of the referencing workflow then fails with a resolution error
+      (the documented blast radius).
+    """
+    email = f"guard_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Guard Tester"
+    })
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    rule_name = f"guarded_rule_{uuid4().hex[:8]}"
+    create = client.post("/api/v1/rules", headers=headers, json={
+        "name": rule_name,
+        "domain": "fraud",
+        "logic_json": {"condition": {"field": "amount", "op": ">", "value": 100}, "result": "OK"}
+    })
+    assert create.status_code == 201, create.text
+    rule_id = create.json()["id"]
+
+    wf = client.post("/api/v1/workflows/draft", headers=headers, json={
+        "name": f"Guard WF {rule_name}",
+        "description": "references the guarded rule",
+        "domain": "fraud",
+        "steps": [{
+            "order_index": 0,
+            "step_type": "DOMAIN_RULE",
+            "name": "Check",
+            "description": "uses guarded rule",
+            "config_json": {"rule_id": rule_name}
+        }]
+    })
+    assert wf.status_code == 201, wf.text
+    wf_id = wf.json()["id"]
+    assert client.post(f"/api/v1/workflows/{wf_id}/approve", headers=headers).status_code == 200
+
+    # Unguarded delete -> 409 naming the referencing workflow; rule survives
+    guarded = client.delete(f"/api/v1/rules/{rule_id}", headers=headers)
+    assert guarded.status_code == 409, guarded.text
+    assert str(wf_id) in guarded.text
+    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 200
+
+    # Forced delete -> 204, rule gone, referencing workflow's next run fails
+    forced = client.delete(f"/api/v1/rules/{rule_id}?force=true", headers=headers)
+    assert forced.status_code == 204, forced.text
+    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
+
+    run = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": wf_id,
+        "account_id": "ACC_FORCE_DEL",
+        "input_data": {"amount": 500}
+    })
+    assert run.status_code == 201, run.text
+    body = run.json()
+    assert body["status"] == RunStatus.FAILED.value
+    assert rule_name in body["error_message"]
+
+
+async def test_rule_version_constraints_enforced(db_session, sample_user):
+    """
+    DB-level integrity from the model constraints (mirrored by migration
+    d7e2b4f9c1a6): duplicate (rule_id, version_number) rows and a second
+    ACTIVE version for the same rule are both rejected by the database.
+    """
+    from sqlalchemy.exc import IntegrityError as IE
+
+    rule = Rule(
+        id=uuid4(),
+        name=f"constraint_rule_{uuid4().hex[:8]}",
+        description=None,
+        domain="fraud"
+    )
+    db_session.add(rule)
+    await db_session.flush()
+
+    v1 = RuleVersion(
+        id=uuid4(),
+        rule_id=rule.id,
+        version_number=1,
+        logic_json={"result": "V1"},
+        is_active=True,
+        created_by=sample_user.id
+    )
+    db_session.add(v1)
+    await db_session.commit()
+
+    session_maker = get_session_maker()
+
+    # 1. Same version_number twice -> violates uq_rule_version_number
+    async with session_maker() as s:
+        dup = RuleVersion(
+            id=uuid4(),
+            rule_id=rule.id,
+            version_number=1,
+            logic_json={"result": "dup"},
+            is_active=True,
+            created_by=sample_user.id
+        )
+        s.add(dup)
+        with pytest.raises(IE):
+            await s.commit()
+        await s.rollback()
+
+    # 2. Second ACTIVE version for the same rule -> violates uq_rule_active_version
+    async with session_maker() as s:
+        second_active = RuleVersion(
+            id=uuid4(),
+            rule_id=rule.id,
+            version_number=2,
+            logic_json={"result": "two actives"},
+            is_active=True,
+            created_by=sample_user.id
+        )
+        s.add(second_active)
+        with pytest.raises(IE):
+            await s.commit()
+        await s.rollback()

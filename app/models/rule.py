@@ -1,6 +1,9 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Text, ForeignKey, Boolean
+from sqlalchemy import (
+    Column, String, Integer, DateTime, JSON, Text, ForeignKey, Boolean,
+    UniqueConstraint, Index, text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -26,6 +29,19 @@ class Rule(Base):
 class RuleVersion(Base):
     """Versioned rule logic using JSON DSL."""
     __tablename__ = "rule_versions"
+    __table_args__ = (
+        # Race-safe version numbering: at most one row per (rule, version).
+        UniqueConstraint("rule_id", "version_number", name="uq_rule_version_number"),
+        # One ACTIVE version per rule (partial unique index; enforced by
+        # create_rule_version semantics + guards against accidental double-actives).
+        Index(
+            "uq_rule_active_version",
+            "rule_id",
+            unique=True,
+            sqlite_where=text("is_active"),
+            postgresql_where=text("is_active"),
+        ),
+    )
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     rule_id = Column(UUID(as_uuid=True), ForeignKey("rules.id"), nullable=False)
