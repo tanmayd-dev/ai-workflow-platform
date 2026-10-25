@@ -24,30 +24,33 @@ def upgrade() -> None:
     # may have left duplicate (rule_id, version_number) rows and multiple
     # active versions per rule. Both would make the new constraints fail.
     bind = op.get_bind()
+    is_sqlite = bind.dialect.name == "sqlite"
+    row_ident = "rowid" if is_sqlite else "ctid"
     # 1) drop duplicate (rule_id, version_number) rows, keeping one per key...
-    bind.execute(sa.text("""
+    bind.execute(sa.text(f"""
         DELETE FROM rule_versions
-        WHERE ctid NOT IN (
-            SELECT MIN(ctid) FROM rule_versions
+        WHERE {row_ident} NOT IN (
+            SELECT MIN({row_ident}) FROM rule_versions
             GROUP BY rule_id, version_number
         )
     """))
     # 2) keep only the highest-numbered active version per rule
-    bind.execute(sa.text("""
+    bind.execute(sa.text(f"""
         UPDATE rule_versions
         SET is_active = FALSE
         WHERE is_active
-          AND ctid NOT IN (
-              SELECT keep.ctid FROM rule_versions AS keep
+          AND {row_ident} NOT IN (
+              SELECT keep.{row_ident} FROM rule_versions AS keep
               WHERE keep.rule_id = rule_versions.rule_id AND keep.is_active
               ORDER BY keep.version_number DESC
               LIMIT 1
           )
     """))
 
-    op.create_unique_constraint(
-        'uq_rule_version_number', 'rule_versions', ['rule_id', 'version_number']
-    )
+    with op.batch_alter_table('rule_versions') as batch_op:
+        batch_op.create_unique_constraint(
+            'uq_rule_version_number', ['rule_id', 'version_number']
+        )
     op.create_index(
         'uq_rule_active_version',
         'rule_versions',
@@ -60,4 +63,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index('uq_rule_active_version', table_name='rule_versions')
-    op.drop_constraint('uq_rule_version_number', 'rule_versions', type_='unique')
+    with op.batch_alter_table('rule_versions') as batch_op:
+        batch_op.drop_constraint('uq_rule_version_number', type_='unique')
