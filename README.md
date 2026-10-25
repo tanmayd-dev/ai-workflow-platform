@@ -61,8 +61,8 @@ python -m app.main
 Server is at `http://localhost:8000`; Swagger UI at `http://localhost:8000/docs`
 (the API itself lives under `http://localhost:8000/api/v1`).
 
-For sample users/workflows/rules, run `python seed_data.py` (full demo dataset)
-or `python seed_simple.py` (minimal). `.env` must be configured first, since the
+For sample users/workflows/rules, run the one-time seeder: `python scripts/seed.py`
+(roles + admin user). `.env` must be configured first, since the
 seed script imports the app and needs `OPENROUTER_API_KEY`/`SECRET_KEY`.
 
 ## Tests
@@ -102,7 +102,7 @@ app/
   2 seeders); consolidation is pending.
 - Runs execute synchronously inside the HTTP request; long executions belong in
   a background task/queue.
-- No Docker, CI, or LICENSE tracking.
+- No CI tracking.
 
 ## License
 
