@@ -1,6 +1,7 @@
 """
 Workflow Compiler Service
 Converts WorkflowDefinition to executable LangGraph StateGraph.
+Supports pausing at HUMAN_APPROVAL nodes and resuming with human verdicts.
 """
 from typing import Dict, Any, List, Optional
 from langchain_core.messages import BaseMessage
@@ -8,11 +9,25 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 
 from app.core.config import get_settings
-from app.models.workflow import WorkflowDefinition, StepType
+from app.models.workflow import WorkflowDefinition, WorkflowStep, StepType
 from app.services.llm_service import LLMService
 from app.services.rule_engine import RuleEngine
 
 settings = get_settings()
+
+
+class WorkflowPaused(Exception):
+    """Raised when workflow reaches a HUMAN_APPROVAL step that requires user input."""
+
+    def __init__(self, step: WorkflowStep, state: Any):
+        self.step = step
+        if isinstance(state, WorkflowState):
+            self.state = state
+        elif isinstance(state, dict):
+            self.state = WorkflowState(**state)
+        else:
+            self.state = WorkflowState()
+        super().__init__(f"Workflow paused at step '{step.name}' awaiting human approval")
 
 
 class WorkflowState(BaseModel):
@@ -41,7 +56,9 @@ class WorkflowCompiler:
     def compile(
         self,
         workflow: WorkflowDefinition,
-        rule_logics: Optional[Dict[str, Dict[str, Any]]] = None
+        rule_logics: Optional[Dict[str, Dict[str, Any]]] = None,
+        start_step_index: int = 0,
+        human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> StateGraph:
         """
         Convert a WorkflowDefinition to an executable LangGraph.
@@ -51,18 +68,27 @@ class WorkflowCompiler:
             rule_logics: Resolved rule logic keyed by rule_id (loaded from DB
                 by the executor). Steps referencing a rule_id absent from this
                 map raise ValueError at compile time.
+            start_step_index: Starting step order_index for compiling a graph
+                (used when resuming from a paused step).
+            human_verdicts: Pre-supplied verdicts keyed by step name for
+                human approval steps.
 
         Returns:
             StateGraph ready for execution
         """
         rule_logics = rule_logics or {}
+        human_verdicts = human_verdicts or {}
         graph = StateGraph(WorkflowState)
 
         # Sort steps by order_index
         sorted_steps = sorted(workflow.steps, key=lambda s: s.order_index)
+        steps_to_run = [s for s in sorted_steps if s.order_index >= start_step_index]
 
-        # Add nodes for each step
-        for step in sorted_steps:
+        if not steps_to_run:
+            raise ValueError(f"No steps to compile starting from index {start_step_index}")
+
+        # Add nodes for each step to run
+        for step in steps_to_run:
             node_name = f"step_{step.order_index}_{step.name.replace(' ', '_')}"
 
             if step.step_type == StepType.AI_ANALYSIS:
@@ -76,25 +102,27 @@ class WorkflowCompiler:
                     )
                 graph.add_node(node_name, self._create_rule_node(step, rule_logics.get(rule_id)))
             elif step.step_type == StepType.HUMAN_APPROVAL:
-                graph.add_node(node_name, self._create_human_node(step))
+                verdict = human_verdicts.get(step.name)
+                graph.add_node(node_name, self._create_human_node(step, verdict=verdict))
             elif step.step_type == StepType.CONDITIONAL:
                 graph.add_node(node_name, self._create_conditional_node(step))
         
         # Define edges (linear flow for now)
-        graph.set_entry_point(f"step_0_{sorted_steps[0].name.replace(' ', '_')}")
+        first_node = f"step_{steps_to_run[0].order_index}_{steps_to_run[0].name.replace(' ', '_')}"
+        graph.set_entry_point(first_node)
         
-        for i in range(len(sorted_steps) - 1):
-            current_node = f"step_{sorted_steps[i].order_index}_{sorted_steps[i].name.replace(' ', '_')}"
-            next_node = f"step_{sorted_steps[i+1].order_index}_{sorted_steps[i+1].name.replace(' ', '_')}"
+        for i in range(len(steps_to_run) - 1):
+            current_node = f"step_{steps_to_run[i].order_index}_{steps_to_run[i].name.replace(' ', '_')}"
+            next_node = f"step_{steps_to_run[i+1].order_index}_{steps_to_run[i+1].name.replace(' ', '_')}"
             graph.add_edge(current_node, next_node)
         
         # Last node goes to END
-        last_node = f"step_{sorted_steps[-1].order_index}_{sorted_steps[-1].name.replace(' ', '_')}"
+        last_node = f"step_{steps_to_run[-1].order_index}_{steps_to_run[-1].name.replace(' ', '_')}"
         graph.add_edge(last_node, END)
         
         return graph.compile()
     
-    def _create_ai_node(self, step, workflow: WorkflowDefinition):
+    def _create_ai_node(self, step, workflow: Optional[WorkflowDefinition] = None):
         """Create an AI analysis node."""
         async def ai_node(state: WorkflowState) -> WorkflowState:
             """Execute AI analysis with (best-effort) RAG context."""
@@ -106,13 +134,14 @@ class WorkflowCompiler:
             # Failures fall back to an empty context so AI nodes still run
             # (e.g. no embeddings model locally, empty collection).
             context_text = ""
-            if rag_query and settings.ENABLE_RAG:
+            domain = workflow.domain if workflow else getattr(step, "domain", "")
+            if rag_query and settings.ENABLE_RAG and domain:
                 try:
                     from app.services.rag_service import RAGService
                     rag_service = RAGService()
                     retrieved_docs = await rag_service.query_similar(
                         query_text=rag_query,
-                        domain=workflow.domain,
+                        domain=domain,
                         top_k=3
                     )
                     context_text = "\n\n".join(doc.get("text", "") for doc in retrieved_docs)
@@ -175,28 +204,21 @@ class WorkflowCompiler:
 
         return rule_node
     
-    def _create_human_node(self, step):
+    def _create_human_node(self, step, verdict: Optional[Dict[str, Any]] = None):
         """Create a human approval node."""
         def human_node(state: WorkflowState) -> WorkflowState:
-            """Await human approval (simulated for now)."""
-            # In real implementation, this would:
-            # 1. Save state to database
-            # 2. Create pending approval record
-            # 3. Wait for human input via API
-            # 4. Resume execution
-            
-            # For now, auto-approve
-            approval = {
-                "approved": True,
-                "approver": "system",
-                "notes": "Auto-approved in demo mode"
-            }
-            
-            state.human_approvals[step.name] = approval
-            state.current_output = approval
-            state.context["last_approval"] = approval
-            
-            return state
+            """Await human approval or apply human verdict."""
+            st = state if isinstance(state, WorkflowState) else WorkflowState(**state)
+            v = verdict or st.human_approvals.get(step.name)
+            if v is not None:
+                st.human_approvals[step.name] = v
+                st.current_output = v
+                st.context["last_approval"] = v
+                if isinstance(v, dict) and "approved" in v:
+                    st.context["approved"] = v["approved"]
+                return st
+
+            raise WorkflowPaused(step=step, state=st)
         
         return human_node
     

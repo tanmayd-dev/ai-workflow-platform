@@ -44,6 +44,7 @@ class WorkflowRun(Base):
     trigger_reason = Column(Text, nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)  # Durable failure/rejection reason
     
     # Relationships
     workflow = relationship("WorkflowDefinition", back_populates="runs")
