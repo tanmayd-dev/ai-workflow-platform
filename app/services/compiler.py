@@ -66,7 +66,7 @@ class WorkflowCompiler:
             node_name = f"step_{step.order_index}_{step.name.replace(' ', '_')}"
 
             if step.step_type == StepType.AI_ANALYSIS:
-                graph.add_node(node_name, self._create_ai_node(step))
+                graph.add_node(node_name, self._create_ai_node(step, workflow))
             elif step.step_type == StepType.DOMAIN_RULE:
                 rule_id = (step.config_json or {}).get("rule_id")
                 if rule_id and rule_id not in rule_logics:
@@ -94,7 +94,7 @@ class WorkflowCompiler:
         
         return graph.compile()
     
-    def _create_ai_node(self, step):
+    def _create_ai_node(self, step, workflow: WorkflowDefinition):
         """Create an AI analysis node."""
         async def ai_node(state: WorkflowState) -> WorkflowState:
             """Execute AI analysis with (best-effort) RAG context."""
