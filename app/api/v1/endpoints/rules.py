@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.core.database import get_db
+from app.core.rbac import require_roles
 from app.models.rule import Rule, RuleVersion
 from app.models.user import User
 from app.models.workflow import WorkflowDefinition, WorkflowStep
@@ -31,12 +32,12 @@ router = APIRouter()
 async def create_rule(
     rule_data: RuleCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles("author")),
 ):
     """
     Create a new rule and its initial version (v1).
 
-    - Requires JWT authentication
+    - Requires the author role (admin bypasses)
     - Body carries name, description, domain, and logic_json (or initial_logic)
     - Creates Rule + RuleVersion (version_number=1, is_active=True, created_by=current user id)
     - Returns 409 Conflict if a rule with this name already exists in the domain
@@ -96,9 +97,10 @@ async def create_rule(
 async def list_rules(
     domain: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
-    List rules including their versions.
+    List rules including their versions (any authenticated user).
     Optionally filter by domain.
     """
     query = select(Rule).options(selectinload(Rule.versions)).order_by(Rule.created_at.desc())
@@ -113,9 +115,10 @@ async def list_rules(
 async def get_rule(
     rule_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
-    Get a single rule by ID including its versions.
+    Get a single rule by ID including its versions (any authenticated user).
     """
     result = await db.execute(
         select(Rule)
@@ -140,12 +143,12 @@ async def create_rule_version(
     rule_id: UUID,
     version_data: RuleVersionCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles("author")),
 ):
     """
     Add a new version for an existing rule.
 
-    - Requires JWT authentication
+    - Requires the author role (admin bypasses)
     - Assigns incremented version_number and is_active=True
     - Flips all older versions to is_active=False (only one active version per rule)
     """
@@ -199,14 +202,14 @@ async def delete_rule(
     rule_id: UUID,
     force: bool = Query(default=False, description="Delete even if workflows still reference the rule"),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles("admin")),
 ):
     """
     Delete a rule and all of its versions.
 
     Explicit deletion strategy:
     Hard DELETE of the Rule record, cascading to all associated RuleVersion records.
-    Requires authenticated user (JWT).
+    Requires the admin role (which bypasses all other role checks).
 
     Guarded against breaking referencing workflows: a rule whose name is used by a
     workflow step's config_json.rule_id cannot be deleted unless ?force=true is

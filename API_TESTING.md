@@ -111,9 +111,11 @@ curl -X POST "http://localhost:8000/api/v1/runs/" \
   }'
 ```
 
-The run executes synchronously: the response carries the final `status`
-(`COMPLETED`/`FAILED`). `input_data` is required for meaningful execution —
-domain rules are evaluated against it and it is stored for replay.
+The run is queued: the response is **202 Accepted** with the run `id` and
+`status: "RUNNING"`. Execution happens after the response in a background task.
+Poll `GET /api/v1/runs/{run_id}` until `status` is `COMPLETED`, `FAILED`, or
+`PAUSED` (waiting for human approval). `input_data` is required for meaningful
+execution — domain rules are evaluated against it and it is stored for replay.
 
 ### 7. Get Run Audit Trail
 ```bash

@@ -1,22 +1,52 @@
 services:
   app:
     build: .
-    ports:
-      - "8000:8000"
+    # Credentials are required from the environment/.env; no insecure defaults.
     environment:
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-your-openrouter-key}
-      SECRET_KEY: ${SECRET_KEY:-change-me-to-a-long-random-string}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      # Runtime state lives on the named volumes below, not in the image layer.
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////data/db/workflow_db.sqlite}
+      CHROMA_DB_DIR: ${CHROMA_DB_DIR:-/data/chroma}
+      DOCUMENTS_DIR: ${DOCUMENTS_DIR:-/data/documents}
+      # The entrypoint runs Alembic; do not also create_all() on startup.
+      AUTO_CREATE_SCHEMA: "false"
+    ports:
+      # Loopback only: public ingress goes through the Cloudflare Tunnel.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - sqlite_data:/data/db
+      - chroma_data:/data/chroma
+      - documents_data:/data/documents
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
 
   postgres:
-    image: postgres:16
+    # postgres:16 multi-arch index digest; contains linux/amd64 and linux/arm64.
+    # The app uses SQLite by default; Postgres remains available for
+    # DATABASE_URL=postgresql+asyncpg://user:pass@postgres:5432/workflow_db.
+    image: postgres:16@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-workflow_db}
     ports:
-      - "5432:5432"
+      # Loopback only; containers reach it over the compose network.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
 volumes:
+  sqlite_data:
+  chroma_data:
+  documents_data:
   postgres_data:

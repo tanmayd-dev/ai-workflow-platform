@@ -56,3 +56,7 @@ logs/
 
 # Alembic
 alembic/versions/__pycache__/
+
+# Test fixtures recreated by tests/conftest.py
+tests/.test_chroma_db/
+tests/.test_documents/

@@ -11,7 +11,10 @@ test configuration everywhere:
 """
 import os
 import shutil
+import asyncio
+import concurrent.futures
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -47,6 +50,93 @@ async def _reset_database():
         for table in reversed(Base.metadata.sorted_tables):
             await session.execute(delete(table))
         await session.commit()
+
+
+ROLE_DESCRIPTIONS = {
+    "admin": "Superuser; bypasses every role check",
+    "author": "Drafts workflows, authors rules, uploads knowledge documents",
+    "approver": "Approves workflow definitions and human-gated runs",
+    "executor": "Starts and replays workflow runs",
+    "auditor": "Read-only access to definitions, runs, and audit trails",
+}
+
+
+async def assign_role(email: str, role_name: str, *, remove: bool = False) -> str:
+    """Test helper: grant/revoke a role for a registered user.
+
+    The role row is get-or-created case-insensitively, so tests can grant
+    ``AUTHOR`` to prove role names are matched case-insensitively.
+    """
+    from sqlalchemy import func, select
+    from app.core.database import get_session_maker
+    from app.models.user import Role, User, UserRole
+
+    name = role_name.strip()
+    key = name.lower()
+
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        user = (
+            await session.execute(select(User).where(User.email == email))
+        ).scalar_one_or_none()
+        if user is None:
+            raise AssertionError(f"test user {email} does not exist")
+
+        role = (
+            await session.execute(select(Role).where(func.lower(Role.name) == key))
+        ).scalar_one_or_none()
+
+        if role is None:
+            if remove:
+                return f"{email} already lacks role '{name}'"
+            role = Role(
+                id=uuid4(),
+                name=name,
+                description=ROLE_DESCRIPTIONS.get(key),
+            )
+            session.add(role)
+            await session.flush()
+
+        link = (
+            await session.execute(
+                select(UserRole).where(
+                    UserRole.user_id == user.id,
+                    UserRole.role_id == role.id,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if remove:
+            if link is None:
+                return f"{email} already lacks role '{role.name}'"
+            await session.delete(link)
+            await session.commit()
+            return f"revoked role '{role.name}' from {email}"
+
+        if link is not None:
+            return f"{email} already has role '{role.name}'"
+
+        session.add(UserRole(id=uuid4(), user_id=user.id, role_id=role.id))
+        await session.commit()
+        return f"granted role '{role.name}' to {email}"
+
+
+def grant_role(email: str, role_name: str = "admin") -> str:
+    """Sync wrapper usable from both sync and pytest-asyncio async tests.
+
+    Async tests already have a running loop, so the short-lived DB write is
+    executed by ``asyncio.run`` on a worker thread instead; the engine uses
+    ``NullPool``, so no loop-bound connection is shared.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(assign_role(email, role_name))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(
+            asyncio.run, assign_role(email, role_name)
+        ).result()
 
 
 @pytest.fixture

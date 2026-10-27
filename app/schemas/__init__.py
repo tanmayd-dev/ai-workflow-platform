@@ -112,6 +112,18 @@ class IntentResponse(BaseModel):
     retrieved_context: str
 
 
+class WorkflowDraft(BaseModel):
+    """Schema the LLM's workflow draft must satisfy before we return it.
+
+    Mirrors ``WorkflowStepCreate`` but deliberately omits ``domain`` (the caller
+    supplies that) and requires at least one step.
+    """
+
+    name: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    steps: List[WorkflowStepCreate] = Field(..., min_length=1)
+
+
 # ============= Rule Schemas =============
 class RuleVersionCreate(BaseModel):
     logic_json: Dict[str, Any]
@@ -200,6 +212,15 @@ class NodeExecutionResponse(BaseModel):
     # documents — validate as any JSON, not dict-only.
     input_snapshot: Optional[Any]
     output_snapshot: Optional[Any]
+
+    # Lineage: exactly which prompt / model / rule version produced this node.
+    prompt_template_id: Optional[UUID] = None
+    prompt_snapshot: Optional[str] = None
+    model_name: Optional[str] = None
+    rule_version_id: Optional[UUID] = None
+    rule_evaluation_result: Optional[Any] = None
+    retrieved_context: Optional[Any] = None
+
     started_at: datetime
     completed_at: Optional[datetime]
     error_message: Optional[str] = None

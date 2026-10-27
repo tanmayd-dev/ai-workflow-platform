@@ -29,15 +29,17 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup."""
-    try:
-        await init_db()
-        print(f"✓ {settings.PROJECT_NAME} started successfully")
-        print(f"✓ API docs available at http://localhost:8000/docs")
-    except Exception as e:
-        print(f"Note: Database initialization skipped or tables already exist: {e}")
-        print(f"✓ {settings.PROJECT_NAME} started successfully")
-        print(f"✓ API docs available at http://localhost:8000/docs")
+    """Initialize database on startup (unless migrations own the schema)."""
+    if settings.AUTO_CREATE_SCHEMA:
+        try:
+            await init_db()
+        except Exception as e:
+            print(f"Note: Database initialization skipped or tables already exist: {e}")
+    else:
+        print("Schema initialization skipped (AUTO_CREATE_SCHEMA=false); "
+              "Alembic migrations are run by the container entrypoint.")
+    print(f"✓ {settings.PROJECT_NAME} started successfully")
+    print(f"✓ API docs available at http://localhost:8000/docs")
 
 
 @app.get("/")

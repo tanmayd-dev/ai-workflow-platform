@@ -9,6 +9,7 @@ from pathlib import Path
 
 from app.core.database import get_db
 from app.core.config import get_settings
+from app.core.rbac import require_roles
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.models.user import User
 from app.models.document import Document
@@ -26,11 +27,13 @@ async def upload_document(
     domain: str = Form("general"),
     description: str = Form(None),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("author"))
 ):
     """
     Upload a document to the knowledge base.
-    
+
+    Requires the author role (admin bypasses).
+
     - Saves file to disk
     - Chunks and embeds content
     - Stores metadata in database
@@ -92,9 +95,10 @@ async def upload_document(
 @router.get("/", response_model=List[DocumentResponse])
 async def list_documents(
     domain: str = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """List all documents, optionally filtered by domain."""
+    """List all documents, optionally filtered by domain (any authenticated user)."""
     query = select(Document)
     if domain:
         query = query.where(Document.domain == domain)
@@ -107,9 +111,10 @@ async def list_documents(
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
     document_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """Get document metadata by ID."""
+    """Get document metadata by ID (any authenticated user)."""
     result = await db.execute(
         select(Document).where(Document.id == document_id)
     )

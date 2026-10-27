@@ -19,6 +19,7 @@ class StepType(str, enum.Enum):
     AI_ANALYSIS = "AI_ANALYSIS"
     DOMAIN_RULE = "DOMAIN_RULE"
     HUMAN_APPROVAL = "HUMAN_APPROVAL"
+    CONDITIONAL = "CONDITIONAL"
 
 
 class WorkflowDefinition(Base):

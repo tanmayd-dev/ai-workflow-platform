@@ -1,9 +1,12 @@
 """Intent-based workflow drafting endpoint."""
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.schemas import IntentRequest, IntentResponse
+from app.core.rbac import require_roles
+from app.models.user import User
+from app.schemas import IntentRequest, IntentResponse, WorkflowDraft
 from app.services.rag_service import RAGService
 from app.services.llm_service import LLMService
 
@@ -13,11 +16,14 @@ router = APIRouter(tags=["intents"])
 @router.post("/draft", response_model=IntentResponse)
 async def draft_from_intent(
     request: IntentRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_roles("author"))
 ):
     """
     Generate a workflow draft from natural language intent.
-    
+
+    Requires the author role (admin bypasses).
+
     Steps:
     1. Query RAG for relevant documents
     2. Call LLM with intent + context
@@ -65,8 +71,21 @@ async def draft_from_intent(
                 status_code=500,
                 detail="Failed to parse workflow draft from LLM response"
             )
-    
+
+    # A syntactically valid draft is not necessarily a usable one: reject
+    # schema-incomplete output instead of handing it back as a workflow.
+    try:
+        draft = WorkflowDraft.model_validate(workflow_draft)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "LLM returned an invalid workflow draft",
+                "errors": exc.errors(include_url=False, include_context=False),
+            },
+        )
+
     return IntentResponse(
-        workflow_draft=workflow_draft,
+        workflow_draft=draft.model_dump(mode="json"),
         retrieved_context=context_text
     )

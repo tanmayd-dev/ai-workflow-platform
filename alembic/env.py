@@ -1,13 +1,18 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
+from dotenv import load_dotenv
 import sys
 import os
 
 # Add parent directory to path to import app modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Load .env for local runs; already-set environment variables (containers) win.
+load_dotenv()
+
 # Import Base (does not trigger async engine creation)
+from app.core.config import DEFAULT_DATABASE_URL, to_sync_database_url
 from app.db.base import Base
 
 # Import all models to register them with Base.metadata
@@ -19,6 +24,18 @@ from app.models.document import Document
 
 # Alembic Config object
 config = context.config
+
+# The app runs on an async driver; Alembic migrations run synchronously. Derive
+# the URL from DATABASE_URL so the container entrypoint and the app agree.
+configured_url = (
+    os.environ.get("DATABASE_URL")
+    or config.get_main_option("sqlalchemy.url")
+    or DEFAULT_DATABASE_URL
+)
+config.set_main_option(
+    "sqlalchemy.url",
+    to_sync_database_url(configured_url).replace("%", "%%"),
+)
 
 # Setup logging
 if config.config_file_name is not None:

@@ -20,12 +20,13 @@ class RAGService:
     
     def __init__(self):
         """Initialize ChromaDB and embedding model."""
-        # Create ChromaDB client
-        self.client = chromadb.Client(
-            ChromaSettings(
-                persist_directory=settings.CHROMA_DB_DIR,
-                anonymized_telemetry=False
-            )
+        # Create ChromaDB client. PersistentClient keeps the index on disk at
+        # CHROMA_DB_DIR; chromadb.Client(Settings(persist_directory=...)) is
+        # ephemeral in chromadb 0.5.x and silently loses ingested documents on
+        # restart (which would defeat the container volume).
+        self.client = chromadb.PersistentClient(
+            path=str(settings.CHROMA_DB_DIR),
+            settings=ChromaSettings(anonymized_telemetry=False),
         )
         
         # Initialize text splitter

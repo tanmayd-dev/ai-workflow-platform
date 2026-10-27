@@ -7,6 +7,7 @@ from typing import List
 from uuid import uuid4, UUID
 
 from app.core.database import get_db
+from app.core.rbac import require_roles
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.models.user import User
 from app.models.workflow import WorkflowDefinition, WorkflowStep, WorkflowStatus
@@ -19,11 +20,12 @@ router = APIRouter()
 async def create_draft_workflow(
     workflow_data: WorkflowCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("author"))
 ):
     """
     Create a draft workflow definition.
-    
+
+    - Requires the author role (admin bypasses)
     - Status: DRAFT
     - Mutable until approved
     """
@@ -72,9 +74,10 @@ async def create_draft_workflow(
 async def list_workflows(
     domain: str = None,
     status: WorkflowStatus = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """List workflows with optional filters."""
+    """List workflows with optional filters (any authenticated user)."""
     query = select(WorkflowDefinition).options(selectinload(WorkflowDefinition.steps))
     
     if domain:
@@ -90,9 +93,10 @@ async def list_workflows(
 @router.get("/{workflow_id}", response_model=WorkflowResponse)
 async def get_workflow(
     workflow_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """Get workflow by ID with all steps."""
+    """Get workflow by ID with all steps (any authenticated user)."""
     result = await db.execute(
         select(WorkflowDefinition)
         .options(selectinload(WorkflowDefinition.steps))
@@ -110,11 +114,12 @@ async def get_workflow(
 async def approve_workflow(
     workflow_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("approver"))
 ):
     """
     Approve a workflow definition.
-    
+
+    - Requires the approver role (admin bypasses)
     - Changes status to APPROVED
     - Workflow becomes immutable
     - Sets approved_by and approved_at

@@ -1,14 +1,15 @@
 """Workflow execution endpoints."""
 import logging
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4, UUID
 
-from app.core.database import get_db
+from app.core.database import get_db, get_session_maker
+from app.core.rbac import require_roles
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.models.user import User
 from app.models.workflow import WorkflowDefinition, WorkflowStatus
@@ -27,22 +28,88 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/", response_model=RunResponse, status_code=201)
+def _is_terminal(status: RunStatus) -> bool:
+    """A run in one of these states will not progress without an API call."""
+    return status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.PAUSED)
+
+
+async def _execute_run_in_background(
+    *,
+    run_id: UUID,
+    workflow_id: UUID,
+    input_data: Dict[str, Any],
+    account_id: str,
+    triggered_by: UUID,
+) -> None:
+    """
+    Execute a queued run in a fresh, task-owned database session.
+
+    The request-scoped ``AsyncSession`` is bound to the HTTP request and may be
+    closed (or torn down) once the response has been sent, so it must never be
+    captured here. All values passed across the boundary are plain data.
+
+    The executor persists terminal state itself (COMPLETED / FAILED / PAUSED)
+    before re-raising; the fallback below only repairs a row that would
+    otherwise be stuck in RUNNING forever (e.g. failure before the executor's
+    own error handling).
+    """
+    session_maker = get_session_maker()
+    # The async context manager always closes the session, even on failure.
+    async with session_maker() as db:
+        try:
+            await WorkflowExecutor().execute(
+                workflow_id=workflow_id,
+                input_data=input_data,
+                account_id=account_id,
+                db=db,
+                run_id=run_id,
+                triggered_by=triggered_by,
+            )
+        except Exception as exc:
+            logger.exception("Background execution failed for run %s", run_id)
+            try:
+                await db.rollback()
+                run = await db.get(WorkflowRun, run_id)
+                if run is not None and not _is_terminal(run.status):
+                    run.status = RunStatus.FAILED
+                    run.error_message = str(exc) or "Background run failed"
+                    run.completed_at = datetime.utcnow()
+                    await db.commit()
+                    logger.error(
+                        "Run %s was not marked FAILED by the executor; repaired the row",
+                        run_id,
+                    )
+                elif run is None:
+                    logger.error("Run %s disappeared while executing in the background", run_id)
+            except Exception:
+                logger.exception("Could not persist FAILED state for run %s", run_id)
+
+
+@router.post("/", response_model=RunResponse, status_code=202)
 async def create_run(
     run_data: RunCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("executor"))
 ):
     """
-    Start a workflow execution run.
+    Queue a workflow execution run and return immediately (202 Accepted).
 
-    The run executes synchronously: once the workflow steps finish, the
-    response carries the final run status. Long-running executions should be
-    moved to a background task/queue later.
+    Requires the executor role (admin bypasses).
+
+    The run row is committed with status RUNNING before this response, so the
+    client can poll ``GET /runs/{run_id}`` until the status reaches a terminal
+    value: COMPLETED, FAILED, or PAUSED (waiting for human approval).
+
+    Execution happens after the response is sent, in a FastAPI background task
+    that opens its own database session; the request-scoped session is never
+    reused. Approve / reject / replay remain synchronous because they resume a
+    single already-prepared run and their results are needed to answer the
+    request.
 
     Constraints:
     - Workflow must be APPROVED
-    - Only one active run per account
+    - Only one active run per account (a second request returns 409)
     """
     # Verify workflow exists and is approved
     result = await db.execute(
@@ -56,7 +123,9 @@ async def create_run(
     if workflow.status != WorkflowStatus.APPROVED:
         raise HTTPException(status_code=400, detail="Only APPROVED workflows can be executed")
 
-    # Check for existing active run for this account
+    # Check for existing active run for this account. The run row below is
+    # committed as RUNNING before the response, keeping this guard effective
+    # even though execution itself is deferred.
     existing_run_result = await db.execute(
         select(WorkflowRun).where(
             and_(
@@ -80,31 +149,26 @@ async def create_run(
         status=RunStatus.RUNNING,
         current_step_index=0,
         triggered_by=current_user.id,
-        trigger_reason=run_data.trigger_reason
+        trigger_reason=run_data.trigger_reason,
+        # Persist inputs up front (not just inside the executor) so the row is
+        # complete and replayable even if the process dies before the task runs.
+        input_data=run_data.input_data,
     )
 
     db.add(run)
     await db.commit()
     await db.refresh(run)
 
-    # Execute the compiled LangGraph with state tracking. On failure the
-    # executor marks the run FAILED and we return that row (500 would lose
-    # the audit trail).
-    executor = WorkflowExecutor()
-    try:
-        run = await executor.execute(
-            workflow_id=run_data.workflow_id,
-            input_data=run_data.input_data,
-            account_id=run_data.account_id,
-            db=db,
-            run_id=run.id,
-            triggered_by=current_user.id
-        )
-    except Exception:
-        # The run row (and its audit trail) stays; surface WHY it failed.
-        logger.exception("Run execution failed for run %s; returning FAILED/partial run row", run.id)
-        await db.refresh(run)
-        return run
+    # Defer execution until after the 202 response is sent. Only plain values
+    # cross the boundary: the background task opens its own session.
+    background_tasks.add_task(
+        _execute_run_in_background,
+        run_id=run.id,
+        workflow_id=run_data.workflow_id,
+        input_data=run_data.input_data,
+        account_id=run_data.account_id,
+        triggered_by=current_user.id,
+    )
 
     return run
 
@@ -112,9 +176,10 @@ async def create_run(
 @router.get("/{run_id}", response_model=RunResponse)
 async def get_run(
     run_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """Get run details."""
+    """Get run details (any authenticated user)."""
     result = await db.execute(
         select(WorkflowRun).where(WorkflowRun.id == run_id)
     )
@@ -131,10 +196,15 @@ async def approve_run(
     run_id: UUID,
     approval_data: Optional[RunApprovalRequest] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("approver"))
 ):
     """
     Approve a paused workflow run and resume execution from the approval node.
+
+    Requires the approver role (admin bypasses).
+
+    This endpoint stays synchronous: the caller needs the resumed run's new
+    status (COMPLETED or the next PAUSED step) in the response.
 
     Constraints:
     - Run must exist (404)
@@ -188,10 +258,15 @@ async def reject_run(
     run_id: UUID,
     reject_data: Optional[RunRejectRequest] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("approver"))
 ):
     """
     Reject a paused workflow run, marking it FAILED with a rejection reason.
+
+    Requires the approver role (admin bypasses).
+
+    Synchronous by design: this only transitions an existing paused run, so
+    the verdict outcome is returned in the response.
 
     Constraints:
     - Run must exist (404)
@@ -239,9 +314,10 @@ async def reject_run(
 @router.get("/{run_id}/executions", response_model=List[NodeExecutionResponse])
 async def get_run_executions(
     run_id: UUID,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
 ):
-    """Get all node executions for a run (audit trail)."""
+    """Get all node executions for a run (audit trail; any authenticated user)."""
     result = await db.execute(
         select(NodeExecution)
         .where(NodeExecution.run_id == run_id)
@@ -256,10 +332,15 @@ async def get_run_executions(
 async def replay_run(
     run_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(require_roles("executor"))
 ):
     """
     Replay a completed run for verification.
+
+    Requires the executor role (admin bypasses).
+
+    Stays synchronous (like approve/reject) so the new run's outcome is
+    returned directly.
 
     - Re-executes all nodes with the original inputs
     - Returns a new run linked via `replayed_from_run_id`

@@ -7,6 +7,7 @@ These tests run entirely in-process:
 - LLM calls are mocked by the `mock_llm` fixture in conftest.py
 """
 import asyncio
+import time
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -17,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from conftest import grant_role
 from app.core.database import get_session_maker
 from app.core.security import get_password_hash
 from app.main import app
@@ -40,6 +42,29 @@ def client():
     """In-process HTTP test client (startup event initializes the DB)."""
     with TestClient(app) as test_client:
         yield test_client
+
+
+TERMINAL_RUN_STATUSES = {
+    RunStatus.COMPLETED.value,
+    RunStatus.FAILED.value,
+    RunStatus.PAUSED.value,
+}
+
+
+def _wait_for_run(
+    client: TestClient, run_id: str, headers: dict, timeout: float = 5.0
+) -> dict:
+    """Poll GET /runs/{id} until the run is COMPLETED, FAILED, or PAUSED."""
+    deadline = time.monotonic() + timeout
+    last_body = None
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v1/runs/{run_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        last_body = response.json()
+        if last_body["status"] in TERMINAL_RUN_STATUSES:
+            return last_body
+        time.sleep(0.05)
+    raise AssertionError(f"Run {run_id} did not finish; last seen: {last_body}")
 
 
 @pytest.fixture
@@ -285,13 +310,14 @@ async def test_workflow_replay(db_session: AsyncSession, sample_workflow: Workfl
 
 
 def test_run_endpoint_executes_workflow(client, sample_workflow, high_risk_rule, mock_llm):
-    """POST /api/v1/runs drives the executor end-to-end (sync execution)."""
+    """POST /api/v1/runs enqueues the run (202); polling reaches COMPLETED."""
     email = f"runner_{uuid4()}@example.com"
 
     register = client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Run User"
     })
     assert register.status_code == 201, register.text
+    grant_role(email, "admin")
 
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
@@ -307,8 +333,8 @@ def test_run_endpoint_executes_workflow(client, sample_workflow, high_risk_rule,
         "input_data": input_data,
         "trigger_reason": "High-value transaction detected"
     })
-    assert created.status_code == 201, created.text
-    run = created.json()
+    assert created.status_code == 202, created.text
+    run = _wait_for_run(client, created.json()["id"], headers)
     assert run["status"] == RunStatus.COMPLETED.value
 
     # Unauthenticated runs are rejected
@@ -319,7 +345,7 @@ def test_run_endpoint_executes_workflow(client, sample_workflow, high_risk_rule,
     assert denied.status_code == 401
 
     # Audit trail: one node execution per step, inputs recorded
-    executions = client.get(f"/api/v1/runs/{run['id']}/executions")
+    executions = client.get(f"/api/v1/runs/{run['id']}/executions", headers=headers)
     assert executions.status_code == 200, executions.text
     assert len(executions.json()) == 2
 
@@ -335,6 +361,7 @@ def test_workflow_endpoints_require_auth_and_record_user(client):
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Author"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={"username": email, "password": "testpass123"})
     assert login.status_code == 200, login.text
     headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
@@ -370,6 +397,7 @@ def test_run_endpoint_fails_without_rule(client, sample_workflow, mock_llm):
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Run User"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -380,8 +408,8 @@ def test_run_endpoint_fails_without_rule(client, sample_workflow, mock_llm):
         "account_id": "ACC999",
         "input_data": {"risk_score": 0.5},
     })
-    assert created.status_code == 201, created.text
-    assert created.json()["status"] == RunStatus.FAILED.value
+    assert created.status_code == 202, created.text
+    assert _wait_for_run(client, created.json()["id"], headers)["status"] == RunStatus.FAILED.value
 
 
 def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, high_risk_rule, mock_llm):
@@ -396,6 +424,7 @@ def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, 
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Approver User"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -410,14 +439,14 @@ def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, 
         "input_data": input_data,
         "trigger_reason": "High fraud score requires human approval"
     })
-    assert created.status_code == 201, created.text
-    run = created.json()
+    assert created.status_code == 202, created.text
+    run = _wait_for_run(client, created.json()["id"], headers)
     run_id = run["id"]
     assert run["status"] == RunStatus.PAUSED.value
     assert run["current_step_index"] == 1
 
     # 2. Check executions while paused: AI step COMPLETED, Approval step PENDING, Rule step not run
-    executions_paused = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    executions_paused = client.get(f"/api/v1/runs/{run_id}/executions", headers=headers).json()
     assert len(executions_paused) == 2
     assert executions_paused[0]["node_type"] == StepType.AI_ANALYSIS.value
     assert executions_paused[0]["status"] == NodeStatus.COMPLETED.value
@@ -435,7 +464,7 @@ def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, 
     assert approved_run["status"] == RunStatus.COMPLETED.value
 
     # 4. Check executions after approval: all 3 steps COMPLETED, rule step evaluated
-    executions_completed = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    executions_completed = client.get(f"/api/v1/runs/{run_id}/executions", headers=headers).json()
     assert len(executions_completed) == 3
     assert executions_completed[0]["status"] == NodeStatus.COMPLETED.value
     assert executions_completed[1]["status"] == NodeStatus.COMPLETED.value
@@ -453,7 +482,7 @@ def test_approval_flow_pause_resume_audit_and_replay(client, approval_workflow, 
     assert replayed["id"] != run_id
 
     # Verify replay node executions are also all completed
-    replay_execs = client.get(f"/api/v1/runs/{replayed['id']}/executions").json()
+    replay_execs = client.get(f"/api/v1/runs/{replayed['id']}/executions", headers=headers).json()
     assert len(replay_execs) == 3
     assert all(e["status"] == NodeStatus.COMPLETED.value for e in replay_execs)
 
@@ -468,6 +497,7 @@ def test_approval_flow_rejection(client, approval_workflow, high_risk_rule, mock
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Rejector User"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -478,9 +508,9 @@ def test_approval_flow_rejection(client, approval_workflow, high_risk_rule, mock
         "account_id": "ACC_REJ_1",
         "input_data": {"risk_score": 0.99},
     })
-    assert created.status_code == 201, created.text
+    assert created.status_code == 202, created.text
     run_id = created.json()["id"]
-    assert created.json()["status"] == RunStatus.PAUSED.value
+    assert _wait_for_run(client, run_id, headers)["status"] == RunStatus.PAUSED.value
 
     # Reject run
     rejection_reason = "Transaction flagged as confirmed identity fraud"
@@ -495,7 +525,7 @@ def test_approval_flow_rejection(client, approval_workflow, high_risk_rule, mock
     assert rejected_run["error_message"] == rejection_reason
 
     # Audit check: approval node execution is FAILED with rejection reason
-    executions = client.get(f"/api/v1/runs/{run_id}/executions").json()
+    executions = client.get(f"/api/v1/runs/{run_id}/executions", headers=headers).json()
     assert len(executions) == 2
     assert executions[0]["status"] == NodeStatus.COMPLETED.value
     assert executions[1]["status"] == NodeStatus.FAILED.value
@@ -503,7 +533,7 @@ def test_approval_flow_rejection(client, approval_workflow, high_risk_rule, mock
     assert executions[1]["output_snapshot"]["approved"] is False
 
     # GET /runs/{run_id} also shows FAILED and error_message
-    get_run_resp = client.get(f"/api/v1/runs/{run_id}").json()
+    get_run_resp = client.get(f"/api/v1/runs/{run_id}", headers=headers).json()
     assert get_run_resp["status"] == RunStatus.FAILED.value
     assert get_run_resp["error_message"] == rejection_reason
 
@@ -517,17 +547,20 @@ def test_approval_endpoints_non_paused_error(client, approval_workflow, sample_w
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Tester"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
     headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
     # 1. Normal workflow that completes without pausing
-    norm_run = client.post("/api/v1/runs/", headers=headers, json={
+    norm_resp = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": str(sample_workflow.id),
         "account_id": "ACC_NORM",
         "input_data": {"risk_score": 0.85},
-    }).json()
+    })
+    assert norm_resp.status_code == 202, norm_resp.text
+    norm_run = _wait_for_run(client, norm_resp.json()["id"], headers)
     assert norm_run["status"] == RunStatus.COMPLETED.value
 
     # Approve on non-paused run -> 400
@@ -539,11 +572,13 @@ def test_approval_endpoints_non_paused_error(client, approval_workflow, sample_w
     assert res.status_code == 400, res.text
 
     # 2. Approval workflow: pause then approve
-    paused_run = client.post("/api/v1/runs/", headers=headers, json={
+    paused_resp = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": str(approval_workflow.id),
         "account_id": "ACC_PAUSED_ERR",
         "input_data": {"risk_score": 0.85},
-    }).json()
+    })
+    assert paused_resp.status_code == 202, paused_resp.text
+    paused_run = _wait_for_run(client, paused_resp.json()["id"], headers)
     assert paused_run["status"] == RunStatus.PAUSED.value
 
     # First approve succeeds -> COMPLETED
@@ -574,6 +609,7 @@ def test_approval_workflow_missing_rule_fails(client, approval_workflow, mock_ll
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Rule Fail User"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -585,8 +621,8 @@ def test_approval_workflow_missing_rule_fails(client, approval_workflow, mock_ll
         "account_id": "ACC_MISSING_RULE",
         "input_data": {"risk_score": 0.5},
     })
-    assert created.status_code == 201, created.text
-    run_body = created.json()
+    assert created.status_code == 202, created.text
+    run_body = _wait_for_run(client, created.json()["id"], headers)
     assert run_body["status"] == RunStatus.FAILED.value
     assert "high_risk_threshold" in run_body["error_message"]
 
@@ -620,6 +656,7 @@ def test_rules_api_auth_and_duplicate_validation(client):
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Auth Tester"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -662,6 +699,7 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
         "email": email, "password": "testpass123", "full_name": "Rule Exec User"
     })
     user_id = reg_resp.json()["id"]
+    grant_role(email, "admin")
 
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
@@ -704,12 +742,12 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
     assert len(alt_create.json()["versions"]) == 1
 
     # 2. GET /rules and GET /rules/{rule_id} include versions
-    get_resp = client.get(f"/api/v1/rules/{rule_id}")
+    get_resp = client.get(f"/api/v1/rules/{rule_id}", headers=headers)
     assert get_resp.status_code == 200, get_resp.text
     assert get_resp.json()["id"] == rule_id
     assert len(get_resp.json()["versions"]) == 1
 
-    list_resp = client.get("/api/v1/rules?domain=fraud")
+    list_resp = client.get("/api/v1/rules?domain=fraud", headers=headers)
     assert list_resp.status_code == 200, list_resp.text
     matching_rules = [r for r in list_resp.json() if r["id"] == rule_id]
     assert len(matching_rules) == 1
@@ -755,12 +793,12 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
         "input_data": {"amount": 750},
         "trigger_reason": "Testing API-created rule"
     })
-    assert run_resp.status_code == 201, run_resp.text
-    run_body = run_resp.json()
+    assert run_resp.status_code == 202, run_resp.text
+    run_body = _wait_for_run(client, run_resp.json()["id"], headers)
     assert run_body["status"] == RunStatus.COMPLETED.value
 
     # Verify node execution recorded rule output
-    execs_resp = client.get(f"/api/v1/runs/{run_body['id']}/executions")
+    execs_resp = client.get(f"/api/v1/runs/{run_body['id']}/executions", headers=headers)
     assert execs_resp.status_code == 200, execs_resp.text
     execs = execs_resp.json()
     assert len(execs) == 2
@@ -788,7 +826,7 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
     assert v2_body["created_by"] == user_id
 
     # Verify older version is flipped to is_active=False
-    updated_rule = client.get(f"/api/v1/rules/{rule_id}").json()
+    updated_rule = client.get(f"/api/v1/rules/{rule_id}", headers=headers).json()
     assert len(updated_rule["versions"]) == 2
     v2_item = next(v for v in updated_rule["versions"] if v["version_number"] == 2)
     v1_item = next(v for v in updated_rule["versions"] if v["version_number"] == 1)
@@ -802,11 +840,11 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
         "input_data": {"amount": 750},
         "trigger_reason": "Testing v2 rule resolution"
     })
-    assert run_v2_resp.status_code == 201, run_v2_resp.text
-    run_v2_body = run_v2_resp.json()
+    assert run_v2_resp.status_code == 202, run_v2_resp.text
+    run_v2_body = _wait_for_run(client, run_v2_resp.json()["id"], headers)
     assert run_v2_body["status"] == RunStatus.COMPLETED.value
 
-    execs_v2 = client.get(f"/api/v1/runs/{run_v2_body['id']}/executions").json()
+    execs_v2 = client.get(f"/api/v1/runs/{run_v2_body['id']}/executions", headers=headers).json()
     assert execs_v2[1]["output_snapshot"] == "FLAG_OVER_500_V2"
 
     # 7. Delete rule via DELETE /rules/{rule_id} — still referenced by the
@@ -817,7 +855,7 @@ def test_rules_api_crud_workflow_execution_and_versioning(client, mock_llm):
     assert del_resp.status_code == 204
 
     # Rule is no longer accessible
-    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
+    assert client.get(f"/api/v1/rules/{rule_id}", headers=headers).status_code == 404
 async def test_rejected_run_error_message_persists_in_database(client, approval_workflow, high_risk_rule, mock_llm):
     """
     The rejection reason must live in the committed workflow_runs row
@@ -828,6 +866,7 @@ async def test_rejected_run_error_message_persists_in_database(client, approval_
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Persist Checker"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -838,9 +877,9 @@ async def test_rejected_run_error_message_persists_in_database(client, approval_
         "account_id": "ACC_PERSIST",
         "input_data": {"risk_score": 0.9},
     })
-    assert created.status_code == 201, created.text
+    assert created.status_code == 202, created.text
     run_id = created.json()["id"]
-    assert created.json()["status"] == RunStatus.PAUSED.value
+    assert _wait_for_run(client, run_id, headers)["status"] == RunStatus.PAUSED.value
 
     rejection_reason = "Rejected: reason must survive request scope"
     reject_resp = client.post(
@@ -872,6 +911,7 @@ def test_racing_verdict_conflict_returns_409(client, approval_workflow, high_ris
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Race 409"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -882,9 +922,9 @@ def test_racing_verdict_conflict_returns_409(client, approval_workflow, high_ris
         "account_id": "ACC_RACE_409",
         "input_data": {"risk_score": 0.9},
     })
-    assert created.status_code == 201, created.text
+    assert created.status_code == 202, created.text
     run_id = created.json()["id"]
-    assert created.json()["status"] == RunStatus.PAUSED.value
+    assert _wait_for_run(client, run_id, headers)["status"] == RunStatus.PAUSED.value
 
     async def lost_claim_resume(self, run_id, verdict, db):
         raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
@@ -964,6 +1004,7 @@ def test_delete_referenced_rule_guarded_by_409_and_force(client, mock_llm):
     client.post("/api/v1/auth/register", json={
         "email": email, "password": "testpass123", "full_name": "Guard Tester"
     })
+    grant_role(email, "admin")
     login = client.post("/api/v1/auth/login", data={
         "username": email, "password": "testpass123"
     })
@@ -998,20 +1039,20 @@ def test_delete_referenced_rule_guarded_by_409_and_force(client, mock_llm):
     guarded = client.delete(f"/api/v1/rules/{rule_id}", headers=headers)
     assert guarded.status_code == 409, guarded.text
     assert str(wf_id) in guarded.text
-    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 200
+    assert client.get(f"/api/v1/rules/{rule_id}", headers=headers).status_code == 200
 
     # Forced delete -> 204, rule gone, referencing workflow's next run fails
     forced = client.delete(f"/api/v1/rules/{rule_id}?force=true", headers=headers)
     assert forced.status_code == 204, forced.text
-    assert client.get(f"/api/v1/rules/{rule_id}").status_code == 404
+    assert client.get(f"/api/v1/rules/{rule_id}", headers=headers).status_code == 404
 
     run = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": wf_id,
         "account_id": "ACC_FORCE_DEL",
         "input_data": {"amount": 500}
     })
-    assert run.status_code == 201, run.text
-    body = run.json()
+    assert run.status_code == 202, run.text
+    body = _wait_for_run(client, run.json()["id"], headers)
     assert body["status"] == RunStatus.FAILED.value
     assert rule_name in body["error_message"]
 
