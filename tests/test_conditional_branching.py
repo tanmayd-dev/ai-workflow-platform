@@ -207,6 +207,213 @@ async def test_conditional_false_branch_skips_true_branch(
     assert "High Path" not in snapshot["ai_outputs"]
 
 
+def _multi_step_branch_steps():
+    """ CONDITIONAL with explicit two-step branch bodies (list targets).
+
+    on_true / on_false are full branch bodies; the shared join (Final Step)
+    belongs to neither body, so wiring is unambiguous for both branches.
+    """
+    gate_config = {
+        "condition": {"field": "amount", "op": ">", "value": 1000},
+        "on_true": ["High Entry", "High Follow-up"],
+        "on_false": ["Low Entry", "Low Follow-up"],
+    }
+    return [
+        (0, StepType.CONDITIONAL, "Gate", gate_config),
+        (1, StepType.AI_ANALYSIS, "High Entry", {"prompt_template": "high 1"}),
+        (2, StepType.AI_ANALYSIS, "High Follow-up", {"prompt_template": "high 2"}),
+        (3, StepType.AI_ANALYSIS, "Low Entry", {"prompt_template": "low 1"}),
+        (4, StepType.AI_ANALYSIS, "Low Follow-up", {"prompt_template": "low 2"}),
+        (5, StepType.AI_ANALYSIS, "Final Step", {"prompt_template": "final"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multi_step_bodies_rejoin_after_false_branch(
+    db_session, operator, mock_llm
+):
+    workflow = await _make_workflow(
+        db_session, operator, "Multi-Step Branch Workflow", _multi_step_branch_steps()
+    )
+    executor = WorkflowExecutor()
+
+    true_run = await executor.execute(
+        workflow_id=workflow.id,
+        input_data={"amount": 5000},
+        account_id="ACC_MULTIBRANCH_TRUE",
+        db=db_session,
+        triggered_by=operator.id,
+    )
+    assert true_run.status == RunStatus.COMPLETED, true_run.error_message
+    true_rows = {name: node for name, node in await _node_rows(db_session, true_run.id)}
+    assert true_rows["Gate"].output_snapshot == {
+        "condition_met": True,
+        "next": "High Entry",
+    }
+    assert true_rows["High Entry"].status == NodeStatus.COMPLETED
+    assert true_rows["High Follow-up"].status == NodeStatus.COMPLETED
+    # The true branch must not leak into the tail of the false branch.
+    assert true_rows["Low Entry"].status == NodeStatus.SKIPPED
+    assert true_rows["Low Follow-up"].status == NodeStatus.SKIPPED
+    assert true_rows["Final Step"].status == NodeStatus.COMPLETED
+
+    false_run = await executor.execute(
+        workflow_id=workflow.id,
+        input_data={"amount": 10},
+        account_id="ACC_MULTIBRANCH_FALSE",
+        db=db_session,
+        triggered_by=operator.id,
+    )
+    assert false_run.status == RunStatus.COMPLETED, false_run.error_message
+    false_rows = {
+        name: node for name, node in await _node_rows(db_session, false_run.id)
+    }
+    assert false_rows["Gate"].output_snapshot == {
+        "condition_met": False,
+        "next": "Low Entry",
+    }
+    assert false_rows["High Entry"].status == NodeStatus.SKIPPED
+    assert false_rows["High Follow-up"].status == NodeStatus.SKIPPED
+    assert false_rows["Low Entry"].status == NodeStatus.COMPLETED
+    assert false_rows["Low Follow-up"].status == NodeStatus.COMPLETED
+    assert false_rows["Final Step"].status == NodeStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_asymmetric_bodies_never_cross_wire(
+    db_session, operator, mock_llm
+):
+    """The narrow-true / wide-false layout must not route H1 into the false body.
+
+    [Gate, High(1), Low(2), Low Follow-up(3), Final(4)] with a one-step true
+    body and a two-step false body is only expressible with list targets; the
+    gate routes High straight to the shared Final step.
+    """
+    workflow = await _make_workflow(
+        db_session,
+        operator,
+        "Narrow True Body Workflow",
+        [
+            (
+                0,
+                StepType.CONDITIONAL,
+                "Gate",
+                {
+                    "condition": {"field": "amount", "op": ">", "value": 1000},
+                    "on_true": ["High Entry"],
+                    "on_false": ["Low Entry", "Low Follow-up"],
+                },
+            ),
+            (1, StepType.AI_ANALYSIS, "High Entry", {"prompt_template": "high"}),
+            (2, StepType.AI_ANALYSIS, "Low Entry", {"prompt_template": "low 1"}),
+            (3, StepType.AI_ANALYSIS, "Low Follow-up", {"prompt_template": "low 2"}),
+            (4, StepType.AI_ANALYSIS, "Final Step", {"prompt_template": "final"}),
+        ],
+    )
+    executor = WorkflowExecutor()
+
+    true_run = await executor.execute(
+        workflow_id=workflow.id,
+        input_data={"amount": 5000},
+        account_id="ACC_ASYMMETRIC_TRUE",
+        db=db_session,
+        triggered_by=operator.id,
+    )
+    assert true_run.status == RunStatus.COMPLETED, true_run.error_message
+    true_rows = {name: node for name, node in await _node_rows(db_session, true_run.id)}
+    # The whole false body (both Low steps) must be skipped on the true path.
+    assert true_rows["High Entry"].status == NodeStatus.COMPLETED
+    assert true_rows["Low Entry"].status == NodeStatus.SKIPPED
+    assert true_rows["Low Follow-up"].status == NodeStatus.SKIPPED
+    assert true_rows["Final Step"].status == NodeStatus.COMPLETED
+
+    false_run = await executor.execute(
+        workflow_id=workflow.id,
+        input_data={"amount": 10},
+        account_id="ACC_ASYMMETRIC_FALSE",
+        db=db_session,
+        triggered_by=operator.id,
+    )
+    assert false_run.status == RunStatus.COMPLETED, false_run.error_message
+    false_rows = {name: node for name, node in await _node_rows(db_session, false_run.id)}
+    assert false_rows["High Entry"].status == NodeStatus.SKIPPED
+    assert false_rows["Low Entry"].status == NodeStatus.COMPLETED
+    assert false_rows["Low Follow-up"].status == NodeStatus.COMPLETED
+    assert false_rows["Final Step"].status == NodeStatus.COMPLETED
+
+
+def test_entry_target_form_rejects_ambiguous_multi_step_layout():
+    """Entry-point string targets + a multi-step earlier region + steps after
+    the later target is ambiguous: those trailing steps cannot be told apart
+    (later-branch body vs shared), so compilation must fail loudly instead of
+    guessing a wiring that could route one branch into the other's steps.
+    """
+    workflow = WorkflowDefinition(
+        id=uuid4(),
+        name="Ambiguous Branch Workflow",
+        domain="fraud",
+        version=1,
+    )
+    workflow.steps = [
+        WorkflowStep(
+            id=uuid4(),
+            order_index=order_index,
+            step_type=step_type,
+            name=step_name,
+            config_json=config_json,
+        )
+        for order_index, step_type, step_name, config_json in [
+            (
+                0,
+                StepType.CONDITIONAL,
+                "Gate",
+                {
+                    "condition": {"field": "amount", "op": ">", "value": 1000},
+                    "on_true": "High Entry",
+                    "on_false": "Low Entry",
+                },
+            ),
+            (1, StepType.AI_ANALYSIS, "High Entry", {"prompt_template": "high 1"}),
+            (2, StepType.AI_ANALYSIS, "High Follow-up", {"prompt_template": "high 2"}),
+            (3, StepType.AI_ANALYSIS, "Low Entry", {"prompt_template": "low 1"}),
+            (4, StepType.AI_ANALYSIS, "Low Follow-up", {"prompt_template": "low 2"}),
+            (5, StepType.AI_ANALYSIS, "Final Step", {"prompt_template": "final"}),
+        ]
+    ]
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        WorkflowCompiler().compile(workflow)
+
+
+def test_multi_step_branch_edges_join_after_later_region():
+    """Compiled edges: the tail of the earlier branch skips past the later region."""
+    workflow = WorkflowDefinition(
+        id=uuid4(),
+        name="Multi-Step Branch Workflow",
+        domain="fraud",
+        version=1,
+    )
+    workflow.steps = [
+        WorkflowStep(
+            id=uuid4(),
+            order_index=order_index,
+            step_type=step_type,
+            name=step_name,
+            config_json=config_json,
+        )
+        for order_index, step_type, step_name, config_json in _multi_step_branch_steps()
+    ]
+
+    graph = WorkflowCompiler().compile(workflow)
+    node_names = {
+        step.name: WorkflowCompiler._node_name(step) for step in workflow.steps
+    }
+    edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+
+    assert (node_names["High Follow-up"], node_names["Final Step"]) in edges
+    assert (node_names["High Follow-up"], node_names["Low Follow-up"]) not in edges
+
+
 @pytest.mark.asyncio
 async def test_conditional_omitted_target_falls_through(
     db_session, operator, mock_llm

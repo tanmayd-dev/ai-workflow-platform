@@ -5,7 +5,7 @@ Supports pausing at HUMAN_APPROVAL nodes, resuming with human verdicts, and
 condition-based branching at CONDITIONAL nodes.
 """
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from langchain_core.messages import BaseMessage
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
@@ -128,14 +128,30 @@ class WorkflowCompiler:
         for step in steps_to_run:
             if step.step_type == StepType.CONDITIONAL:
                 conditional_specs[step.order_index] = self._resolve_conditional_spec(
-                    step, name_to_index, node_names
+                    step, name_to_index, node_names, sorted_steps
                 )
 
-        # Linear successors, then override the tail of bounded branch regions.
-        # A conditional with two targets partitions [earlier_target, later_target)
-        # as the earlier branch, which rejoins after the later target. A
-        # conditional with one target treats the steps between itself and the
-        # target as the fall-through branch, which rejoins after the target.
+        # Linear successors first, then apply the conditional wiring overrides.
+        #
+        # CONDITIONAL semantics:
+        #
+        #  Entry-target form (on_true/on_false are single step names):
+        #    Two targets: the earlier branch owns the contiguous region
+        #    [earlier_target, later_target); the later branch is the *single*
+        #    step at later_target; every step after it is shared by both
+        #    paths (this is what makes nested gate regions compose). When the
+        #    earlier region spans more than one step AND more steps follow the
+        #    later target, the layout is ambiguous — those trailing steps could
+        #    be later-branch body steps or shared steps — so compile with list
+        #    bodies instead (see below) rather than guessing a wiring that can
+        #    silently route one branch into the other's steps.
+        #    One target: the fall-through branch is [conditional, target) and
+        #    rejoins after the target.
+        #
+        #  Explicit-body form (on_true/on_false are lists of step names):
+        #    Both branch bodies are stated in full; the shared join is the
+        #    first step after the conditional that belongs to neither body.
+        #    Wiring is explicit and unambiguous by construction.
         successors: Dict[int, Optional[int]] = {}
         for position, step in enumerate(steps_to_run):
             successors[step.order_index] = (
@@ -143,41 +159,98 @@ class WorkflowCompiler:
                 if position + 1 < len(steps_to_run)
                 else None
             )
+        index_set = set(indices)
 
         regions = []
-        immediate_fallthroughs = []
+        immediate_fallthroughs: List[Tuple[int, int]] = []
+        explicit_bodies: List[Tuple[int, List[int], List[int]]] = []
         for step in steps_to_run:
             spec = conditional_specs.get(step.order_index)
             if spec is None:
                 continue
-            target_indices = sorted({
-                name_to_index[name]
-                for name in (spec["on_true"], spec["on_false"])
-                if name is not None
-            })
-            if len(target_indices) == 2:
-                regions.append((target_indices[0], target_indices[1]))
+            true_body = [name_to_index[name] for name in spec["true_body"]]
+            false_body = [name_to_index[name] for name in spec["false_body"]]
+            target_indices = sorted(
+                {index for body in (true_body, false_body) for index in body}
+            )
+            if true_body != [target_indices[0]] or false_body != (
+                [target_indices[-1]] if len(target_indices) == 2 else []
+            ):
+                # At least one side lists a full branch body: wire it explicitly.
+                explicit_bodies.append((step.order_index, true_body, false_body))
+            elif len(target_indices) == 2:
+                earlier_target, later_target = target_indices
+                steps_after_later = [
+                    i for i in indices if i > later_target
+                ]
+                earlier_region_width = later_target - earlier_target
+                if earlier_region_width > 1 and len(steps_after_later) > 1:
+                    raise ValueError(
+                        f"Conditional step '{step.name}' has multi-step branch "
+                        f"bodies but only entry-point targets; steps after "
+                        f"'{spec['on_false']}' are ambiguous (branch body or "
+                        f"shared?). Use explicit list targets instead: "
+                        f"config_json.on_true/[on_false] as [\"<step name>\", ...]."
+                    )
+                # The earlier branch's tail exits at the successor of the later
+                # branch's single step — the shared join. Never swallow the last
+                # step of the compile range; it stays the common rejoin when it
+                # is the only step after the later target.
+                exit_anchor = later_target
+                regions.append((earlier_target, later_target, exit_anchor))
             elif len(target_indices) == 1:
                 target_index = target_indices[0]
                 if step.order_index + 1 < target_index:
-                    regions.append((step.order_index + 1, target_index))
+                    regions.append(
+                        (step.order_index + 1, target_index, target_index)
+                    )
                 else:
                     # Target is the immediate next step: the fall-through branch
                     # must skip it and rejoin after it.
                     immediate_fallthroughs.append((step.order_index, target_index))
 
         # Wider (outer) regions first; narrower nested regions may override them.
-        # The region exit is the *successor of the region's end step* — not a
-        # naive index+1 — so a nested branch that ends inside an outer branch
-        # follows the outer branch's rejoin point instead of leaking into the
-        # sibling branch.
+        # A region's tail exits at the successor of its own end anchor — not a
+        # naive index+1 — so the earlier branch jumps past the later branch,
+        # and a nested branch that ends inside an outer branch follows the
+        # outer branch's rejoin point instead of leaking into the sibling
+        # branch.
         regions.sort(key=lambda region: region[1] - region[0], reverse=True)
-        for start, end in regions:
+        for start, end, exit_anchor in regions:
             region_indices = [i for i in indices if start <= i < end]
             if region_indices:
-                successors[region_indices[-1]] = successors.get(end)
+                successors[region_indices[-1]] = successors.get(exit_anchor)
         for conditional_index, target_index in immediate_fallthroughs:
             successors[conditional_index] = successors.get(target_index)
+
+        # Explicit branch bodies wire after the regional overrides so an
+        # explicitly stated body always wins over the inference above.
+        for conditional_index, true_body, false_body in explicit_bodies:
+            unlisted = [
+                i for i in indices
+                if i > conditional_index
+                and i not in true_body
+                and i not in false_body
+            ]
+            join = min(unlisted) if unlisted else None
+            if join is not None:
+                past_join = [
+                    i for i in (*true_body, *false_body) if i > join
+                ]
+                if past_join:
+                    raise ValueError(
+                        f"Conditional step '{index_to_name[conditional_index]}' "
+                        f"has explicit branch bodies that reach past the first "
+                        f"shared step '{index_to_name[join]}'; move shared "
+                        f"steps after both branches."
+                    )
+            for body in (true_body, false_body):
+                for position, index in enumerate(body):
+                    next_index = (
+                        body[position + 1] if position + 1 < len(body) else join
+                    )
+                    if successors[index] != next_index:
+                        successors[index] = next_index
 
         # Add nodes for each step to run
         for step in steps_to_run:
@@ -253,8 +326,16 @@ class WorkflowCompiler:
         step: WorkflowStep,
         name_to_index: Dict[str, int],
         node_names: Dict[str, str],
+        sorted_steps: List[WorkflowStep],
     ) -> Dict[str, Any]:
-        """Validate a CONDITIONAL step's config and resolve its branch targets."""
+        """Validate a CONDITIONAL step's config and resolve its branch targets.
+
+        ``on_true``/``on_false`` each accept a step *name* (entry-point form,
+        whose wiring is inferred) or a non-empty list of step names (explicit
+        branch body, wired exactly as listed). The spec carries the route
+        entries (first body element) in ``on_true``/``on_false`` and the full
+        bodies in ``true_body``/``false_body``.
+        """
         config = step.config_json or {}
         condition = config.get("condition")
         if not isinstance(condition, dict) or not condition:
@@ -263,27 +344,68 @@ class WorkflowCompiler:
                 f"config_json.condition object"
             )
 
-        resolved: Dict[str, Any] = {"condition": condition, "on_true": None, "on_false": None}
+        resolved: Dict[str, Any] = {
+            "condition": condition,
+            "on_true": None,
+            "on_false": None,
+            "true_body": [],
+            "false_body": [],
+        }
+        step_types = {s.name: s.step_type for s in sorted_steps}
         for key in ("on_true", "on_false"):
+            body_key = "true_body" if key == "on_true" else "false_body"
             target = config.get(key)
             if target is None:
                 continue
-            if target not in name_to_index:
+            if isinstance(target, (list, tuple)):
+                body = list(target)
+            else:
+                # A single entry-point target is a one-element body.
+                body = [target]
+            if not body or not all(isinstance(name, str) for name in body):
                 raise ValueError(
-                    f"Conditional step '{step.name}' references unknown target "
-                    f"'{target}' in config_json.{key}"
+                    f"Conditional step '{step.name}' config_json.{key} must be "
+                    f"a step name or a non-empty list of step names"
                 )
-            if target not in node_names:
+            if len(set(body)) != len(body):
                 raise ValueError(
-                    f"Conditional step '{step.name}' routes to '{target}', which is "
-                    f"not part of the compiled step range"
+                    f"Conditional step '{step.name}' config_json.{key} "
+                    f"repeats a step name"
                 )
-            if name_to_index[target] <= step.order_index:
+            indices_in_order = []
+            for name in body:
+                if name not in name_to_index:
+                    raise ValueError(
+                        f"Conditional step '{step.name}' references unknown "
+                        f"target '{name}' in config_json.{key}"
+                    )
+                if name not in node_names:
+                    raise ValueError(
+                        f"Conditional step '{step.name}' routes to a branch "
+                        f"step '{name}' that is not part of the compiled "
+                        f"step range"
+                    )
+                if name_to_index[name] <= step.order_index:
+                    raise ValueError(
+                        f"Conditional step '{step.name}' can only branch "
+                        f"forward; branch target '{name}' is not after it"
+                    )
+                if len(body) > 1 and step_types[name] == StepType.CONDITIONAL:
+                    raise ValueError(
+                        f"Conditional step '{step.name}' lists nested "
+                        f"conditional '{name}' inside an explicit multi-step "
+                        f"branch body, which is not supported; branches start "
+                        f"at their entry step, place the nested gate before "
+                        f"the branching step instead"
+                    )
+                indices_in_order.append(name_to_index[name])
+            if indices_in_order != sorted(indices_in_order):
                 raise ValueError(
-                    f"Conditional step '{step.name}' can only branch forward; "
-                    f"target '{target}' is not after it"
+                    f"Conditional step '{step.name}' config_json.{key} branch "
+                    f"body must be listed in forward execution order"
                 )
-            resolved[key] = target
+            resolved[key] = body[0]
+            resolved[body_key] = body
         return resolved
 
     def _guard_node(self, step: WorkflowStep, node_fn):
