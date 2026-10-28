@@ -257,6 +257,49 @@ class WorkflowExecutor:
             details=payload,
         )
 
+    async def _discard_cancelled_run(
+        self, db: AsyncSession, run_pk: UUID
+    ) -> Optional[WorkflowRun]:
+        """Roll back the current execution transaction for a cancelled run.
+
+        A concurrent ``POST /runs/{id}/cancel`` flips the run row to CANCELLED
+        without touching the lease. The terminal status writes before each
+        commit are guarded by a CAS on ``status = RUNNING``; when that CAS
+        matches zero rows the caller must NOT commit a terminal status over
+        the cancellation, so the pending node executions / audit rows are
+        dropped here and the CANCELLED row is returned.
+        """
+        await db.rollback()
+        logger.warning(
+            "Run %s was cancelled mid-execution; dropping execution results", run_pk
+        )
+        return await db.get(WorkflowRun, run_pk)
+
+    async def _terminal_cas_claim(
+        self,
+        db: AsyncSession,
+        run_pk: UUID,
+        *,
+        status: RunStatus,
+    ) -> bool:
+        """Atomically claim the RUNNING -> ``status`` terminal transition.
+
+        CAS on the committed row state: the UPDATE only matches while the run
+        is still RUNNING, i.e. no concurrent cancel (which itself changed the
+        status in a separate transaction) has reached the row. Zero rows means
+        the caller must drop its results instead of committing.
+        """
+        guard = await db.execute(
+            update(WorkflowRun)
+            .where(
+                WorkflowRun.id == run_pk,
+                WorkflowRun.status == RunStatus.RUNNING,
+            )
+            .values(status=status)
+            .execution_options(synchronize_session=False)
+        )
+        return guard.rowcount > 0
+
     @staticmethod
     def _coerce_uuid(value: Any) -> Optional[UUID]:
         if isinstance(value, UUID):
@@ -421,6 +464,11 @@ class WorkflowExecutor:
         run.input_data = input_data  # Persist inputs so `replay()` can re-execute
         run_pk = run.id  # Plain-Python PK snapshot, safe to use after any session state change
         await self._audit_run(db, run, "started", details={"account_id": account_id})
+        # Durability checkpoint: the run row, its inputs, and the "started"
+        # audit commit before execution so a crash mid-execution still leaves a
+        # discoverable RUNNING row (reaped by the startup lease sweep) instead
+        # of vanishing entirely.
+        await db.commit()
 
         try:
             # Resolve rule logic from the rule library, then compile to a graph.
@@ -454,9 +502,20 @@ class WorkflowExecutor:
             run.completed_at = datetime.utcnow()
             run.output_data = final_state.current_output
             run.state_snapshot = final_state.model_dump()
+            # Terminal CAS FIRST: status-affecting ORM mutations are deferred
+            # until the claim is won, so no mid-transaction flush (e.g. from
+            # the audit savepoints) can commit a terminal status over a
+            # concurrent cancel.
+            if not await self._terminal_cas_claim(db, run_pk, status=RunStatus.COMPLETED):
+                return await self._discard_cancelled_run(db, run_pk)
+
+            run.status = RunStatus.COMPLETED
+            run.completed_at = datetime.utcnow()
+            run.output_data = final_state.current_output
+            run.state_snapshot = final_state.model_dump()
             run.current_step_index = sorted_steps[-1].order_index if sorted_steps else 0
             await self._audit_run(db, run, "completed")
-            
+
             await db.commit()
             await db.refresh(run)
             
@@ -484,6 +543,12 @@ class WorkflowExecutor:
                     )
                     break
 
+            # Sink CAS from the resume() claim: the PAUSED transition only
+            # commits if the run is still RUNNING (a cancel that landed
+            # mid-execution wins and the paused snapshot is dropped).
+            if not await self._terminal_cas_claim(db, run_pk, status=RunStatus.PAUSED):
+                return await self._discard_cancelled_run(db, run_pk)
+
             run.status = RunStatus.PAUSED
             run.current_step_index = paused_step.order_index
             run.state_snapshot = pause_state.model_dump()
@@ -504,10 +569,6 @@ class WorkflowExecutor:
             # missing rule, node error) so the session is still usable; if the
             # session itself is poisoned by a DB-level error, re-attach by the
             # snapshotted PK and retry once.
-            run.status = RunStatus.FAILED
-            run.error_message = str(e)
-            run.completed_at = datetime.utcnow()
-
             failed_step_name = getattr(e, "workflow_step", None)
             failed_step = next(
                 (s for s in workflow.steps if s.name == failed_step_name), None
@@ -532,6 +593,17 @@ class WorkflowExecutor:
                 "failed",
                 details={"error_type": type(e).__name__},
             )
+            # Terminal CAS: if the run was cancelled mid-flight, the
+            # cancellation wins and the failure is dropped (no status-affecting
+            # ORM mutation happened before this check, so no flush could have
+            # already overwritten a cancellation). Re-raise so the caller's own
+            # handling sees the hard failure.
+            if not await self._terminal_cas_claim(db, run_pk, status=RunStatus.FAILED):
+                await self._discard_cancelled_run(db, run_pk)
+                raise
+            run.status = RunStatus.FAILED
+            run.error_message = str(e)
+            run.completed_at = datetime.utcnow()
             try:
                 await db.commit()
             except Exception:

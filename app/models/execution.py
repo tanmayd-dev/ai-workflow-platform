@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, JSON, Text, Enum as SQLEnum, ForeignKey, Boolean
+from sqlalchemy import Column, String, Integer, DateTime, JSON, Text, Enum as SQLEnum, ForeignKey, Boolean, Index, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import enum
@@ -13,6 +13,7 @@ class RunStatus(str, enum.Enum):
     PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class NodeStatus(str, enum.Enum):
@@ -27,7 +28,28 @@ class NodeStatus(str, enum.Enum):
 class WorkflowRun(Base):
     """Workflow execution run (one active per account)."""
     __tablename__ = "workflow_runs"
-    
+    __table_args__ = (
+        # DB-enforced replacement for the old check-then-insert active-run
+        # guard: a second RUNNING/PAUSED run for one account violates this
+        # index at commit time. (Defined here as well as in the migration so
+        # create_all-based test schemas get the same enforcement.)
+        Index(
+            "uq_workflow_runs_active_per_account",
+            "account_id",
+            unique=True,
+            sqlite_where=text("status IN ('RUNNING', 'PAUSED')"),
+            postgresql_where=text("status IN ('RUNNING', 'PAUSED')"),
+        ),
+        # Idempotency: one run per Idempotency-Key (NULL keys are exempt).
+        Index(
+            "uq_workflow_runs_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workflow_id = Column(UUID(as_uuid=True), ForeignKey("workflow_definitions.id"), nullable=False)
     account_id = Column(String, nullable=False, index=True)  # Account being assessed
@@ -46,6 +68,10 @@ class WorkflowRun(Base):
     lease_token = Column(String, nullable=True)
     lease_issued_at = Column(DateTime, nullable=True)
     lease_expires_at = Column(DateTime, nullable=True)
+
+    # Idempotency: retrying POST /runs with the same key returns the original
+    # run instead of creating a duplicate decision (unique partial index).
+    idempotency_key = Column(String(200), nullable=True)
 
     # Audit
     triggered_by = Column(UUID(as_uuid=True), nullable=False)

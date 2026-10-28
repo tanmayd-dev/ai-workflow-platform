@@ -2,17 +2,18 @@
 import asyncio
 import logging
 from datetime import datetime
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Response
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update, or_
 from sqlalchemy.orm import selectinload
 from typing import Any, Dict, List, Optional
 from uuid import uuid4, UUID
 
 from app.core.database import get_db, get_session_maker
-from app.core.rbac import require_roles
+from app.core.rbac import ADMIN_ROLE, require_roles
 from app.api.v1.endpoints.auth import get_current_active_user
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.workflow import WorkflowDefinition, WorkflowStatus
 from app.models.execution import WorkflowRun, NodeExecution, RunStatus
 from app.schemas import (
@@ -33,10 +34,60 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+# Only these statuses count as "active" against the one-active-run-per-account
+# constraint and the cancel transition guard.
+ACTIVE_RUN_STATUSES = [RunStatus.RUNNING, RunStatus.PAUSED]
+
+IDEMPOTENCY_KEY_MAX_LENGTH = 200
+
 
 def _is_terminal(status: RunStatus) -> bool:
     """A run in one of these states will not progress without an API call."""
-    return status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.PAUSED)
+    return status in (
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.PAUSED,
+        RunStatus.CANCELLED,
+    )
+
+
+async def _load_user_with_roles(db: AsyncSession, user: Optional[User]) -> Optional[User]:
+    """Re-load the user with ``user_roles`` → ``role`` eagerly (async-safe)."""
+    if user is None:
+        return None
+    result = await db.execute(
+        select(User)
+        .options(selectinload(User.user_roles).selectinload(UserRole.role))
+        .where(User.id == user.id)
+    )
+    return result.scalar_one_or_none() or user
+
+
+def _has_admin_role(user: Optional[User]) -> bool:
+    if user is None:
+        return False
+    return any(
+        (link.role is not None and link.role.name or "").strip().lower() == ADMIN_ROLE
+        for link in (user.user_roles or [])
+    )
+
+
+async def _is_admin(db: AsyncSession, user: Optional[User]) -> bool:
+    """True when the user holds the ``admin`` superuser role.
+
+    Kept in this module (not app.core.rbac, which belongs to another change
+    area) so the cancel/approve maker-checker checks can load the role links
+    with a session they already own, even when the dependency didn't preload
+    ``user_roles``.
+    """
+    return _has_admin_role(await _load_user_with_roles(db, user))
+
+
+def _replay_response(response: Response, existing_run: WorkflowRun) -> WorkflowRun:
+    """Mark a 200 replay of an idempotent request on the response object."""
+    response.status_code = 200
+    response.headers["Idempotency-Key-Replayed"] = "true"
+    return existing_run
 
 
 async def _execute_run_in_background(
@@ -140,8 +191,10 @@ async def _execute_run_in_background(
 async def create_run(
     run_data: RunCreate,
     background_tasks: BackgroundTasks,
+    response: Response,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_roles("executor"))
+    current_user: User = Depends(require_roles("executor")),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
     Queue a workflow execution run and return immediately (202 Accepted).
@@ -150,7 +203,7 @@ async def create_run(
 
     The run row is committed with status RUNNING before this response, so the
     client can poll ``GET /runs/{run_id}`` until the status reaches a terminal
-    value: COMPLETED, FAILED, or PAUSED (waiting for human approval).
+    value: COMPLETED, FAILED, PAUSED, or CANCELLED.
 
     Execution happens after the response is sent, in a FastAPI background task
     that opens its own database session; the request-scoped session is never
@@ -160,8 +213,19 @@ async def create_run(
 
     Constraints:
     - Workflow must be APPROVED
-    - Only one active run per account (a second request returns 409)
+    - Only one active run per account: enforced by a partial unique index
+      (account_id WHERE status IN (RUNNING, PAUSED)); a duplicate request
+      fails at commit and returns 409.
+    - Optional ``Idempotency-Key`` header (<= 200 chars): repeated requests
+      with the same key return the original run (200 + ``Idempotency-Key-
+      Replayed: true``) instead of creating a duplicate decision.
     """
+    if idempotency_key and len(idempotency_key) > IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Idempotency-Key must be at most {IDEMPOTENCY_KEY_MAX_LENGTH} characters",
+        )
+
     # Verify workflow exists and is approved
     result = await db.execute(
         select(WorkflowDefinition).where(WorkflowDefinition.id == run_data.workflow_id)
@@ -174,24 +238,16 @@ async def create_run(
     if workflow.status != WorkflowStatus.APPROVED:
         raise HTTPException(status_code=400, detail="Only APPROVED workflows can be executed")
 
-    # Check for existing active run for this account. The run row below is
-    # committed as RUNNING before the response, keeping this guard effective
-    # even though execution itself is deferred.
-    existing_run_result = await db.execute(
-        select(WorkflowRun).where(
-            and_(
-                WorkflowRun.account_id == run_data.account_id,
-                WorkflowRun.status.in_([RunStatus.RUNNING, RunStatus.PAUSED])
-            )
+    # Idempotent replay: a run already stored under this key is returned as-is.
+    if idempotency_key:
+        replay_result = await db.execute(
+            select(WorkflowRun)
+            .where(WorkflowRun.idempotency_key == idempotency_key)
+            .order_by(WorkflowRun.started_at.desc(), WorkflowRun.id.desc())
         )
-    )
-    existing_run = existing_run_result.scalar_one_or_none()
-
-    if existing_run:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Account {run_data.account_id} already has an active run: {existing_run.id}"
-        )
+        existing = replay_result.scalars().first()
+        if existing:
+            return _replay_response(response, existing)
 
     run = WorkflowRun(
         id=uuid4(),
@@ -204,10 +260,48 @@ async def create_run(
         # Persist inputs up front (not just inside the executor) so the row is
         # complete and replayable even if the process dies before the task runs.
         input_data=run_data.input_data,
+        idempotency_key=idempotency_key,
     )
 
     db.add(run)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # The one-active-run-per-account partial unique index (and, under true
+        # concurrency, the idempotency-key index) fires at commit. Identify the
+        # collateral run and give a definite answer instead of a raw 500.
+        await db.rollback()
+
+        if idempotency_key:
+            replay_result = await db.execute(
+                select(WorkflowRun)
+                .where(WorkflowRun.idempotency_key == idempotency_key)
+                .order_by(WorkflowRun.started_at.desc(), WorkflowRun.id.desc())
+            )
+            existing = replay_result.scalars().first()
+            if existing:
+                return _replay_response(response, existing)
+
+        active_result = await db.execute(
+            select(WorkflowRun)
+            .where(
+                and_(
+                    WorkflowRun.account_id == run_data.account_id,
+                    WorkflowRun.status.in_(ACTIVE_RUN_STATUSES),
+                )
+            )
+            .order_by(WorkflowRun.started_at.desc(), WorkflowRun.id.desc())
+        )
+        active_run = active_result.scalars().first()
+        if active_run:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Account {run_data.account_id} already has an active run: {active_run.id}",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="run already active for this account",
+        )
     await db.refresh(run)
 
     # Defer execution until after the 202 response is sent. Only plain values
@@ -418,6 +512,94 @@ async def reject_run(
             detail=f"Executor failed while rejecting run {run_id}; run is marked FAILED"
         )
 
+    return run
+
+
+@router.post("/{run_id}/cancel", response_model=RunResponse)
+async def cancel_run(
+    run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Cancel a RUNNING or PAUSED run (409 on terminal status, 404 unknown).
+
+    Authorization: the same user who triggered the run, or an admin
+    (superuser). Other users get 403 regardless of run state.
+
+    The status transition is a CAS UPDATE on the current status, so a double
+    cancel (or a race with approve/reject on a PAUSED run) cannot double-fire.
+    Cancel never mutates the lease columns: for a RUNNING run the status flip
+    is what the executing task notices — its terminal write is guarded by the
+    same CAS pattern (only commits COMPLETED/PAUSED/FAILED while the row is
+    still RUNNING), so a cancelled run stays CANCELLED and the executor drops
+    its results. For a PAUSED run, cancellation is immediate (there is no live
+    lease).
+
+    Ruling (T2.2): cancel does not require an expired lease — the WHERE clause
+    matches on status only, and no lease columns are touched, so a live
+    execution's lease is never yanked.
+    """
+    result = await db.execute(
+        select(WorkflowRun).where(WorkflowRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Re-load with roles eagerly once: needed both for the admin check and the
+    # audit row's actor role (accessing user lazily would hit MissingGreenlet).
+    role_user = await _load_user_with_roles(db, current_user)
+    if run.triggered_by != current_user.id and not _has_admin_role(role_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the user who triggered this run (or an admin) can cancel it",
+        )
+
+    if run.status not in (RunStatus.RUNNING, RunStatus.PAUSED):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Run {run_id} is not cancellable "
+                f"(current: {run.status}; only RUNNING or PAUSED runs can be cancelled)"
+            ),
+        )
+
+    cancellable_status = run.status
+    claim = await db.execute(
+        update(WorkflowRun)
+        .where(WorkflowRun.id == run_id, WorkflowRun.status == cancellable_status)
+        .values(
+            status=RunStatus.CANCELLED,
+            error_message=(
+                f"Cancelled by {getattr(current_user, 'email', None) or str(current_user.id)}"
+            ),
+            completed_at=datetime.utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if claim.rowcount == 0:
+        # Lost the race with approve/reject/another cancel: report the fresh state.
+        await db.refresh(run)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {run_id} is not cancellable (current: {run.status})",
+        )
+
+    # Audit trail: who cancelled (mirrors the executor's audit-row style).
+    executor = WorkflowExecutor()
+    await executor._audit_run(
+        db,
+        run,
+        "cancelled",
+        actor_id=current_user.id,
+        actor_role=executor._actor_role(role_user),
+        details={"previous_status": cancellable_status.value},
+    )
+
+    await db.commit()
+    await db.refresh(run)
     return run
 
 
