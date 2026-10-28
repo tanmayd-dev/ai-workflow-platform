@@ -5,10 +5,10 @@ Executes compiled workflows and manages execution state.
 import asyncio
 import logging
 from uuid import UUID, uuid4
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, or_
 from sqlalchemy.orm import selectinload
 
 from app.models.rule import Rule, RuleVersion
@@ -24,6 +24,111 @@ from app.models.user import User
 from app.services.compiler import WorkflowCompiler, WorkflowState, WorkflowPaused
 
 logger = logging.getLogger(__name__)
+
+# Durable lease TTL for background run execution. The background task claims the
+# run before executing (CAS on a NULL/expired lease) and must re-extend the
+# lease more often than this TTL while the run is alive.
+LEASE_TTL_SECONDS = 300
+
+
+async def try_claim_run_lease(
+    db: AsyncSession,
+    run_id: UUID,
+    *,
+    ttl_seconds: int = LEASE_TTL_SECONDS,
+    token: Optional[str] = None,
+) -> Optional[str]:
+    """Atomically claim a RUNNING run for execution; return the lease token.
+
+    Single compare-and-swap UPDATE: the claim only applies when the run is
+    RUNNING and nobody holds a live lease (lease_token IS NULL, or the expiry
+    has passed). Zero rows updated means someone else already owns the run
+    and the caller must not execute it. ``token`` may be supplied for tests
+    to force two distinguishable claim attempts.
+    """
+    lease_token = token or uuid4().hex
+    now = datetime.utcnow()
+    result = await db.execute(
+        update(WorkflowRun)
+        .where(
+            WorkflowRun.id == run_id,
+            WorkflowRun.status == RunStatus.RUNNING,
+            or_(
+                WorkflowRun.lease_token.is_(None),
+                WorkflowRun.lease_expires_at < now,
+            ),
+        )
+        .values(
+            lease_token=lease_token,
+            lease_issued_at=now,
+            lease_expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        return None
+    return lease_token
+
+
+async def extend_run_lease(
+    db: AsyncSession,
+    run_id: UUID,
+    token: str,
+    *,
+    ttl_seconds: int = LEASE_TTL_SECONDS,
+) -> bool:
+    """Re-extend the lease iff the caller still owns it (heartbeat)."""
+    now = datetime.utcnow()
+    result = await db.execute(
+        update(WorkflowRun)
+        .where(
+            WorkflowRun.id == run_id,
+            WorkflowRun.lease_token == token,
+            WorkflowRun.status == RunStatus.RUNNING,
+        )
+        .values(lease_expires_at=now + timedelta(seconds=ttl_seconds))
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return result.rowcount > 0
+
+
+async def sweep_stale_running_runs(db: AsyncSession) -> int:
+    """Startup crash recovery: fail RUNNING runs nobody holds a lease for.
+
+    Called once from the app lifespan. A RUNNING run left behind by a process
+    kill has either no lease at all (crashed before/without claiming) or an
+    expired one (crashed mid-execution after the heartbeat lapsed, or a second
+    process exited while still executing). Both are indistinguishable from
+    "the execution will never come back", so they are marked FAILED durably
+    and the account's active-run slot frees up.
+
+    Runs whose lease is still fresh/live are deliberately left RUNNING: with a
+    single process that cannot happen (the sweep only sees stale or never-held
+    leases), and with multiple processes it protects a run owned by another
+    live worker. PAUSED runs are never swept — the approval flow is durable
+    (state snapshots persist) and resume is an explicit API call.
+    """
+    now = datetime.utcnow()
+    result = await db.execute(
+        update(WorkflowRun)
+        .where(
+            WorkflowRun.status == RunStatus.RUNNING,
+            or_(
+                WorkflowRun.lease_token.is_(None),
+                WorkflowRun.lease_expires_at < now,
+            ),
+        )
+        .values(
+            status=RunStatus.FAILED,
+            error_message="interrupted by server restart (no live lease)",
+            completed_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return result.rowcount
 
 
 class WorkflowExecutor:

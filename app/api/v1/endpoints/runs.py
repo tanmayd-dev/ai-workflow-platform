@@ -1,4 +1,5 @@
 """Workflow execution endpoints."""
+import asyncio
 import logging
 from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -21,7 +22,12 @@ from app.schemas import (
     RunApprovalRequest,
     RunRejectRequest,
 )
-from app.services.executor import WorkflowExecutor
+from app.services.executor import (
+    LEASE_TTL_SECONDS,
+    WorkflowExecutor,
+    extend_run_lease,
+    try_claim_run_lease,
+)
 
 router = APIRouter()
 
@@ -48,6 +54,13 @@ async def _execute_run_in_background(
     closed (or torn down) once the response has been sent, so it must never be
     captured here. All values passed across the boundary are plain data.
 
+    Before executing, the task durably claims the run via a lease CAS (single
+    UPDATE matching a NULL/expired lease). Zero rows claimed means another
+    worker owns the run already, so this task aborts silently. While the run
+    executes, a lightweight heartbeat task keeps re-extending the lease so a
+    startup sweep cannot reap a live run; the run typically finishes in-process
+    long before the first heartbeat fires.
+
     The executor persists terminal state itself (COMPLETED / FAILED / PAUSED)
     before re-raising; the fallback below only repairs a row that would
     otherwise be stuck in RUNNING forever (e.g. failure before the executor's
@@ -56,6 +69,38 @@ async def _execute_run_in_background(
     session_maker = get_session_maker()
     # The async context manager always closes the session, even on failure.
     async with session_maker() as db:
+        lease_token = await try_claim_run_lease(db, run_id)
+        if lease_token is None:
+            logger.info(
+                "Background execution skipped for run %s: lease not claimable "
+                "(already owned, restarted, or no longer RUNNING)",
+                run_id,
+            )
+            return
+
+        stop_heartbeat = asyncio.Event()
+
+        async def _heartbeat() -> None:
+            """Keep the lease alive while the executor works."""
+            interval = LEASE_TTL_SECONDS / 3
+            while True:
+                try:
+                    # Returns as soon as the executor finishes; TimeoutError
+                    # means the interval elapsed and the lease needs extending.
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    return
+                # Heartbeat uses its own short-lived session so it can commit
+                # while the executor's transaction is still open.
+                async with session_maker() as hb_db:
+                    try:
+                        await extend_run_lease(hb_db, run_id, lease_token)
+                    except Exception:
+                        logger.exception("Lease heartbeat failed for run %s", run_id)
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
         try:
             await WorkflowExecutor().execute(
                 workflow_id=workflow_id,
@@ -83,6 +128,12 @@ async def _execute_run_in_background(
                     logger.error("Run %s disappeared while executing in the background", run_id)
             except Exception:
                 logger.exception("Could not persist FAILED state for run %s", run_id)
+        finally:
+            stop_heartbeat.set()
+            try:
+                await heartbeat_task
+            except Exception:
+                logger.exception("Lease heartbeat crashed for run %s", run_id)
 
 
 @router.post("/", response_model=RunResponse, status_code=202)

@@ -40,6 +40,13 @@ class WorkflowRun(Base):
     output_data = Column(JSON, nullable=True)  # Final decision output (COMPLETED approval/replay paths)
     replayed_from_run_id = Column(UUID(as_uuid=True), nullable=True)  # Set when this run is a replay
     
+    # Execution lease (durable claim against concurrent/duplicated execution).
+    # NULL lease_token = nobody holds the run; the background executor CAS-claims
+    # it before executing and extends (heartbeats) the expiry while it works.
+    lease_token = Column(String, nullable=True)
+    lease_issued_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+
     # Audit
     triggered_by = Column(UUID(as_uuid=True), nullable=False)
     trigger_reason = Column(Text, nullable=True)
