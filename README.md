@@ -17,16 +17,18 @@ this table.
 | Auth (register/login/me) | ✅ Works | SHA-256+salt password hashing, JWT bearer tokens (see note below) |
 | RBAC (roles on endpoints) | ✅ Enforced | `admin`/`author`/`approver`/`executor`/`auditor`; strict mapping (no role → 403), `admin` bypasses |
 | Document upload + RAG ingestion | ✅ Works | ChromaDB + HuggingFace embeddings, per-domain collections |
-| Workflow CRUD (draft/approve/freeze) | ✅ Works | `created_by` is still a placeholder UUID, not the caller |
-| Workflow | ✅ Works | Compiles to a real LangGraph `StateGraph` (AI / rule / approval / conditional nodes) |
+| Workflow CRUD (draft/approve/freeze) | ✅ Works | `created_by` is the real JWT caller id, recorded on create and on approval |
+| Workflow compilation | ✅ Works | Compiles to a real LangGraph `StateGraph` (AI / rule / approval / conditional nodes) |
+| Conditional branch bodies | ✅ Works | `config_json.on_true`/`on_false` each take a list of step names `["A","B"]` wired exactly as listed (required for multi-step branch bodies); string entry-target form still works for single-step bodies and a contiguous earlier region with a single later step. Ambiguous layouts raise `ValueError` at compile time, so mistakes can't produce silently wrong wiring. |
 | Execution from the HTTP API | ✅ Works, asynchronous | `POST /api/v1/runs` returns **202** with the run id and executes in a FastAPI background task; poll `GET /api/v1/runs/{id}` to `COMPLETED`/`FAILED`/`PAUSED`; JWT-protected; `input_data` stored for replay; LLM output mocked in tests |
-| Replay | ✅ Works | `POST /api/v1/runs/{id}/replay` re-executes with stored inputs |
-| Intent drafting (`POST /api/v1/intents/draft`) | ⚠️ Requires LLM | Calls OpenRouter; no offline test coverage |
+| Run output visibility | ✅ Works | Terminal runs expose `output_data` in `GET /runs/{id}`: the final decision output — a dict for AI/approval steps, a scalar for rule steps. The same per-node inputs/outputs are in `GET /runs/{id}/executions`. |
+| Human approval steps | ✅ Works | Approval nodes pause the run into a persisted `PAUSED` state with a pending node row; an approver resumes via `POST /api/v1/runs/{id}/approve` (compare-and-swap on the paused node row) or rejects via `POST /api/v1/runs/{id}/reject`. Not simulated. |
+| Rules resolution | ✅ Works | Rule logic resolved from `rules`/`rule_versions` tables at execution time (steps reference rules by name; the executor resolves the latest active version) |
+| Replay | ⚠️ Works, not deterministic | `POST /api/v1/runs/{id}/replay` re-executes with stored inputs — it re-calls the LLM and re-resolves the latest active rule versions, so it is not a deterministic replay. Allowed only for `COMPLETED` runs. |
+| Intent drafting (`POST /api/v1/intents/draft`) | ⚠️ Requires LLM | Calls OpenRouter; covered offline by 5 tests in `tests/test_intent_drafting.py` (LLM mocked) |
 | RAG context inside AI nodes | ⚠️ Best-effort | Retrieval is attempted when `ENABLE_RAG=true`; empty context on failure |
-| Human approval steps | ⚠️ Simulated | Approval nodes auto-approve with a "system" signature; no pending-state loop yet |
-| Rules resolution | ✅ Works | Rule logic resolved from `rules`/`rule_versions` tables at execution time (was hardcoded before) |
-| Tests | ✅ `pytest -q` | In-process tests (`TestClient` + direct executor), LLM mocked |
-| Config bootstrap | ✅ Works | `.env.example` included |
+| Tests | ✅ `pytest -q` | 97 tests. In-process tests (`TestClient` + direct executor), LLM mocked; `test_rag_service.py` is the exception — it exercises real ChromaDB and a real local HuggingFace embedding model (downloads ~88 MB on first run) |
+| Config bootstrap | ✅ Works | `.env.example` included; `DEBUG` gates SQL echo (off by default) and `CORS_ORIGINS` is an opt-in CSV of explicit browser origins (no CORS middleware when unset) |
 | Docker | ✅ Compose | Persistent volumes, entrypoint migrations, `/health` check, arm64 digests |
 | CI | ✅ GitHub Actions | Tests + ruff correctness gate |
 | Auth migrations | ⚠️ Manual | Existing local DBs: `alembic upgrade head`; containers migrate via entrypoint |
@@ -55,10 +57,14 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt   # only needed for running the tests
 
 cp .env.example .env                  # fill in OPENROUTER_API_KEY and SECRET_KEY
-alembic upgrade head                  # only if a DB already exists; fresh DBs auto-create
+alembic upgrade head                  # if a DB already exists; brings it up to head, including a3d9f2c4e8b1 (adds workflow_runs.output_data)
 
 python -m app.main
 ```
+
+Fresh databases are created automatically; `alembic upgrade head` is for
+updating an existing local DB — migration `a3d9f2c4e8b1` adds the
+`output_data` column to `workflow_runs`.
 
 Server is at `http://localhost:8000`; Swagger UI at `http://localhost:8000/docs`
 (the API itself lives under `http://localhost:8000/api/v1`).
@@ -139,10 +145,15 @@ kept for deployments that switch `DATABASE_URL` to
 pytest -q
 ```
 
-Tests run against a throwaway SQLite file via the in-process app; LLM calls are
-mocked, so no API key is consumed. `scripts/` (root-level `test_*.py`, `demo*.py`,
-`execute_*.py`) are manual smoke scripts from development — they hit a live
-server at `127.0.0.1:8000` and are not part of the test suite.
+97 tests run against a throwaway SQLite file via the in-process app; LLM calls
+are mocked, so no API key is consumed. `test_rag_service.py` is the exception:
+it exercises real ChromaDB and a real local HuggingFace embedding model and
+downloads the ~88 MB model on first run.
+
+The demo scripts under `scripts/` (root-level experiment scripts were
+consolidated there long ago) hit a live server at `127.0.0.1:8000` and are not
+part of the test suite. `scripts/demo.py` is the authoritative authenticated
+walkthrough — it is offline-capable (no AI step, no LLM call).
 
 ## Project structure
 
@@ -161,20 +172,35 @@ app/
 └── api/v1/endpoints/       # REST API endpoints
 ```
 
-## Known limitations / next steps
+## Known limitations
 
-- Human-approval nodes pause execution in a real pending state and resume via POST /runs/{id}/approve or fail via POST /runs/{id}/reject.
-- Auth is enforced on every endpoint: all reads require a JWT and mutations
-  additionally require the role in the matrix above (workflow draft/approve,
-  rule create/version/delete, run start/replay/approve/reject, document upload,
-  intent drafting). `admin` bypasses role checks.
-- The root-level scripts duplicate each other (4 API smoke scripts, 3 demos,
-  2 seeders); consolidation is pending.
-- Runs are enqueued with FastAPI `BackgroundTasks`: `POST /runs` returns 202
-  immediately and execution happens after the response using its own DB
-  session. Poll `GET /runs/{id}` for the outcome. A durable worker/queue is the
-  next step for multi-process deployments. `approve`, `reject`, and `replay`
-  remain synchronous.
+Last reviewed against the code on this branch; the fixes whose absence used to
+be listed here (real human-approval pause/resume, real `created_by`, offline
+intent-drafting tests, script consolidation, `GET /documents/{id}`, run
+`output_data`, multi-step conditional branch bodies, `DEBUG`/`CORS_ORIGINS`
+handling) have landed and are covered by the table above.
+
+- Runs execute via FastAPI `BackgroundTasks`, which is **not durable**: there
+  is no worker/queue, so a process crash or restart leaves matching `RUNNING`
+  rows stranded and `PAUSED` runs resume only because they are persisted. A
+  durable worker is the next step for multi-process deployments. `approve`,
+  `reject`, and `replay` remain synchronous.
+- If the background executor dies mid-run, an approve/reject on the stranded
+  pause can return **500** (rather than 200 with a FAILED body).
+- Replay is not deterministic: it re-executes the graph — re-calls the LLM and
+  re-resolves the **latest active** rule version per step rather than the
+  versions used in the original run. Replay is allowed only for `COMPLETED`
+  runs.
+- No `GET /runs` list endpoint yet (only per-run fetch); no audit-log API yet.
+- Rule DSL has no write-time validation — malformed `logic_json` surfaces only
+  at execution time.
+- Approver separation is not enforced: an approver **may approve a run they
+  triggered themselves** (maker-checker is not yet implemented).
+- Password hashing is SHA-256+salt (stdlib), not bcrypt/argon2.
+- Uploaded documents: UTF-8 text only, no size limit, and no delete endpoint.
+- Single-tenant: all reads (workflows, rules, runs, documents) are global to
+  any authenticated user.
+- No pagination on list endpoints.
 
 ## License
 

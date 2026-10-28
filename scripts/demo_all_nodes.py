@@ -1,6 +1,13 @@
 """
 Demonstration: All Node Types in One Workflow
 Shows: AI_ANALYSIS (LLM), DOMAIN_RULE (System), HUMAN_APPROVAL (Human)
+
+NOTE (status): This script hits real AI/LLM paths and needs a live server,
+per-role users (author, approver, executor -- currently it sends no auth at
+all, so it only works against an unauthenticated or fully-bypassing session),
+and a working OpenRouter key. It is deprecated in favor of scripts/demo.py,
+the authoritative authenticated, offline-capable walkthrough. Use it only for
+manual live sessions; its logic is not being ported across.
 """
 import requests
 import json

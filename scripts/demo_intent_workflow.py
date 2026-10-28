@@ -3,6 +3,13 @@ Demo: AI-Generated Workflow from Intent
 1. Uploads Loan Policy to Knowledge Base
 2. Asks AI to "Create a workflow to approve a loan"
 3. Displays the generated workflow definition
+
+NOTE (status): This script hits real AI/LLM paths (OpenRouter intent drafting
+plus RAG ingestion with the local embedding model) and needs a live server,
+per-role users (author for upload/drafting -- currently it sends no auth at
+all), and a working OpenRouter key. It is deprecated in favor of
+scripts/demo.py, the authoritative authenticated, offline-capable walkthrough.
+Use it only for manual live sessions; its logic is not being ported across.
 """
 import requests
 import json

@@ -1,230 +1,287 @@
 """
-End-to-end demonstration of the AI-Governed Workflow System.
+Authoritative authenticated end-to-end walkthrough of the workflow platform.
 
-This script demonstrates the full workflow:
-1. Upload a regulatory document
-2. Draft a workflow from natural language intent
-3. Create and approve a workflow
-4. (Future) Execute the workflow
+Everything happens against a live server (default http://127.0.0.1:8000) using
+only the HTTP API. This script is offline-capable by design: the workflow uses
+no AI_ANALYSIS step, so **no OpenRouter key and no LLM call is involved**.
+
+What it does:
+1. Log in as the seeded admin user (admin bypasses role checks, so it authors
+   rules and the workflow and is allowed to start runs).
+2. Create a dedicated approver user, grant the `approver` role with
+   `scripts/assign_role.py`, and log in as that user.
+3. Seed the DOMAIN_RULE logics the workflow references (via the rules API),
+   skipping rules that already exist.
+4. Create an offline-capable workflow: CONDITIONAL gate (explicit list branch
+   bodies) + DOMAIN_RULE branch steps + shared HUMAN_APPROVAL join.
+5. Approve (freeze) the workflow with the approver-role user.
+6. Start a run (202 Accepted), poll to PAUSED, approve the paused run, poll to
+   COMPLETED.
+7. Print the per-node executions and the run's final `output_data`.
+
+Prerequisites: a running server seeded with `python scripts/seed.py`, and
+`.env` configured (the step-3 role assignment imports the app).
+
+Credentials, overridable via environment:
+- Admin (starts the run; `executor` role is bypassed by admin):
+  DEMO_EMAIL / DEMO_PASSWORD, default admin@acmebank.com / admin123
+- Approver (approves the workflow and the paused run):
+  DEMO_APPROVER_EMAIL / DEMO_APPROVER_PASSWORD,
+  default approver@acmebank.com / approver123
 """
-import requests
 import json
+import os
+import subprocess
+import sys
+import time
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
-BASE_URL = "http://127.0.0.1:8000"
+import requests
 
-def print_section(title):
-    """Print a formatted section header."""
-    print("\n" + "=" * 70)
-    print(f"  {title}")
-    print("=" * 70)
+BASE_URL = os.environ.get("DEMO_BASE_URL", "http://127.0.0.1:8000")
+API = f"{BASE_URL}/api/v1"
 
-def create_sample_document():
-    """Create a sample regulatory document."""
-    content = """
-FRAUD DETECTION POLICY - ACME BANK
+ADMIN_EMAIL = os.environ.get("DEMO_EMAIL", "admin@acmebank.com")
+ADMIN_PASSWORD = os.environ.get("DEMO_PASSWORD", "admin123")
+APPROVER_EMAIL = os.environ.get("DEMO_APPROVER_EMAIL", "approver@acmebank.com")
+APPROVER_PASSWORD = os.environ.get("DEMO_APPROVER_PASSWORD", "approver123")
+POLL_INTERVAL_S = 0.5
+POLL_TIMEOUT_S = 30
 
-High-Risk Transaction Criteria:
-1. Transaction amount exceeds $10,000
-2. Transaction originates from high-risk jurisdiction
-3. Multiple failed authentication attempts in past 24 hours
-4. Transaction pattern deviates significantly from account history
-
-Risk Assessment Requirements:
-- Transactions with risk score > 0.8: Immediate escalation to fraud team with human review required within 2 hours
-- Transactions with risk score 0.5-0.8: Additional verification required, may proceed after automated checks
-- Transactions with risk score < 0.5: Auto-approve with standard monitoring
-
-Mandatory Controls:
-- All transactions over $50,000 require dual approval
-- AI risk assessments must be logged with full context
-- All escalated cases must maintain complete audit trail
-- Decisions must be replayable for regulatory compliance
-
-Approved Processing Steps:
-1. AI analyzes transaction against historical patterns and known fraud indicators
-2. Rule engine evaluates risk score against threshold policies  
-3. Human approval for high-risk or high-value transactions
-4. Final decision logged with complete reasoning chain
-"""
-    
-    filepath = Path("sample_fraud_policy.txt")
-    filepath.write_text(content)
-    return filepath
-
-## Step 1: Upload Document
-print_section("STEP 1: Upload Regulatory Document")
-
-# Create sample document
-doc_path = create_sample_document()
-print(f"✓ Created sample document: {doc_path}")
-
-try:
-    with open(doc_path, 'rb') as f:
-        files = {'file': (doc_path.name, f, 'text/plain')}
-        data = {
-            'domain': 'fraud',
-            'description': 'Fraud detection policy and procedures'
-        }
-        
-        response = requests.post(
-            f"{BASE_URL}/api/v1/documents/upload",
-            files=files,
-            data=data
-        )
-        
-        if response.status_code == 201:
-            doc_data = response.json()
-            print(f"✓ Document uploaded successfully!")
-            print(f"  - ID: {doc_data['id']}")
-            print(f"  - Chunks created: {doc_data['chunk_count']}")
-            print(f"  - Domain: {doc_data['domain']}")
-        else:
-            print(f"✗ Upload failed: {response.status_code}")
-            print(f"  Error: {response.text}")
-except Exception as e:
-    print(f"✗ Upload failed: {e}")
-
-## Step 2: Draft Workflow from Intent
-print_section("STEP 2: AI-Assisted Workflow Drafting")
-
-intent_request = {
-    "intent": "Create a fraud assessment workflow for high-value transactions that uses AI to analyze risk, applies rule-based thresholds, and requires human approval for high-risk cases",
-    "domain": "fraud"
+# DOMAIN_RULE steps reference rules by name; seed these via the rules API.
+RULES = {
+    "demo_high_risk_rule": {
+        "name": "demo_high_risk_rule",
+        "description": "High-risk transactions (risk_score > 0.8) are escalated",
+        "domain": "demo",
+        "logic_json": {
+            "condition": {"field": "risk_score", "op": ">", "value": 0.8},
+            "result": "ESCALATE_HIGH_RISK",
+        },
+    },
+    "demo_high_value_rule": {
+        "name": "demo_high_value_rule",
+        "description": "High-value transactions get a secondary confirmation",
+        "domain": "demo",
+        "logic_json": {
+            "condition": {"field": "amount", "op": ">", "value": 10000},
+            "result": "HIGH_VALUE_CONFIRMED",
+        },
+    },
+    "demo_standard_rule": {
+        "name": "demo_standard_rule",
+        "description": "Low-risk transactions proceed on the standard track",
+        "domain": "demo",
+        "logic_json": {
+            "condition": {"field": "risk_score", "op": "<=", "value": 0.8},
+            "result": "PROCEED_STANDARD",
+        },
+    },
 }
 
-try:
-    response = requests.post(
-        f"{BASE_URL}/api/v1/intents/draft",
-        json=intent_request
-    )
-    
-    if response.status_code == 200:
-        result = response.json()
-        print("✓ AI-generated workflow draft:")
-        print(json.dumps(result['workflow_draft'], indent=2))
-        
-        # Save for next step
-        workflow_draft = result['workflow_draft']
-        print(f"\n✓ Retrieved context from {len(result.get('retrieved_context', ''))} characters of regulatory docs")
-    else:
-        print(f"✗ Drafting failed: {response.status_code}")
-        print(f"  Error: {response.text}")
-        # Create manual workflow as fallback
-        workflow_draft = {
-            "name": "Fraud Assessment Workflow",
-            "description": "AI-assisted fraud detection for high-value transactions",
-            "steps": []
-        }
-except Exception as e:
-    print(f"✗ Drafting failed: {e}")
-    workflow_draft = {
-        "name": "Fraud Assessment Workflow",
-        "description": "AI-assisted fraud detection workflow",
-        "steps": []
-    }
-
-## Step 3: Create Workflow
-print_section("STEP 3: Create and Approve Workflow")
-
-# Use the AI-drafted workflow or create a manual one
-workflow_create_request = {
-    "name": workflow_draft.get("name", "Fraud Assessment Workflow"),
-    "description": workflow_draft.get("description", "AI-assisted fraud detection"),
-    "domain": "fraud",
-    "steps": workflow_draft.get("steps", [
-        {
-            "order_index": 0,
-            "step_type": "AI_ANALYSIS",
-            "name": "Risk Scoring",
-            "description": "AI analyzes transaction for fraud indicators",
-            "config_json": {
-                "rag_query": "fraud risk assessment criteria",
-                "prompt_template": "Analyze this transaction for fraud risk based on regulatory guidelines"
-            }
+STEPS = [
+    {
+        "order_index": 0,
+        "step_type": "CONDITIONAL",
+        "name": "Value Gate",
+        "description": "Route by transaction size",
+        "config_json": {
+            "condition": {"field": "amount", "op": ">", "value": 10000},
+            "on_true": ["High-Risk Check", "High-Value Secondary Check"],
+            "on_false": ["Standard Check"],
         },
-        {
-            "order_index": 1,
-            "step_type": "DOMAIN_RULE",
-            "name": "Threshold Evaluation",
-            "description": "Apply rule-based risk thresholds",
-            "config_json": {
-                "rule_id": "fraud_risk_threshold"
-            }
-        },
-        {
-            "order_index": 2,
-            "step_type": "HUMAN_APPROVAL",
-            "name": "Manual Review",
-            "description": "Human reviews high-risk transactions",
-            "config_json": {}
-        }
-    ])
-}
+    },
+    {
+        "order_index": 1,
+        "step_type": "DOMAIN_RULE",
+        "name": "High-Risk Check",
+        "description": "Rule evaluates the risk score",
+        "config_json": {"rule_id": "demo_high_risk_rule"},
+    },
+    {
+        "order_index": 2,
+        "step_type": "DOMAIN_RULE",
+        "name": "High-Value Secondary Check",
+        "description": "Rule re-checks the transaction amount",
+        "config_json": {"rule_id": "demo_high_value_rule"},
+    },
+    {
+        "order_index": 3,
+        "step_type": "DOMAIN_RULE",
+        "name": "Standard Check",
+        "description": "Rule evaluates the risk score",
+        "config_json": {"rule_id": "demo_standard_rule"},
+    },
+    {
+        "order_index": 4,
+        "step_type": "HUMAN_APPROVAL",
+        "name": "Manual Review",
+        "description": "Human gate: the run pauses here until an approver resumes it",
+        "config_json": {},
+    },
+]
 
-try:
-    response = requests.post(
-        f"{BASE_URL}/api/v1/workflows/draft",
-        json=workflow_create_request
-    )
-    
-    if response.status_code == 201:
-        workflow = response.json()
-        workflow_id = workflow['id']
-        print(f"✓ Workflow created successfully!")
-        print(f"  - ID: {workflow_id}")
-        print(f"  - Name: {workflow['name']}")
-        print(f"  - Status: {workflow['status']}")
-        print(f"  - Steps: {len(workflow['steps'])}")
-        
-        # Approve the workflow
-        print("\n  Approving workflow...")
-        approval_response = requests.post(
-            f"{BASE_URL}/api/v1/workflows/{workflow_id}/approve"
+INPUT_DATA = {"amount": 15000, "risk_score": 0.91}
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
+
+
+def api(method: str, path: str, token: str | None = None, expect: int = 200,
+        **kwargs) -> dict | list:
+    """Perform an authenticated REST call and return the JSON payload.
+
+    Attaches the bearer token when given and raises SystemExit on an
+    unexpected status code, printing the response body for diagnosis.
+    """
+    headers = kwargs.pop("headers", {}) or {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.request(method, f"{API}{path}", headers=headers, timeout=30, **kwargs)
+    if response.status_code != expect:
+        raise SystemExit(
+            f"✗ {method} {path} returned {response.status_code}, expected {expect}\n"
+            f"  Body: {response.text}\n"
+            "  Is the server running ('python -m app.main') and has seed.py been run?"
         )
-        
-        if approval_response.status_code == 200:
-            approved_workflow = approval_response.json()
-            print(f"  ✓ Workflow approved!")
-            print(f"    - Status: {approved_workflow['status']}")
-            print(f"    - Approved at: {approved_workflow['approved_at']}")
-        else:
-            print(f"  ✗ Approval failed: {approval_response.status_code}")
+    if not response.content:
+        return {}
+    return response.json()
+
+
+def login(email: str, password: str) -> tuple[str, dict]:
+    """Log in (OAuth2 form fields) and return (token, user profile)."""
+    token_response = api(
+        "POST",
+        "/auth/login",
+        expect=200,
+        data={"username": email, "password": password},
+    )
+    me = api("GET", "/auth/me", token=token_response["access_token"], expect=200)
+    return token_response["access_token"], me
+
+
+def ensure_approver_user() -> tuple[str, dict]:
+    """Register + assign the approver role to the demo approver, then log in."""
+    register = requests.post(
+        f"{API}/auth/register",
+        json={"email": APPROVER_EMAIL, "password": APPROVER_PASSWORD, "full_name": "Demo Approver"},
+        timeout=30,
+    )
+    if register.status_code == 201:
+        print(f"  ✓ Registered approver user {APPROVER_EMAIL}")
+    elif register.status_code in (400, 409):
+        print(f"  = Approver user {APPROVER_EMAIL} already exists (register returned {register.status_code})")
     else:
-        print(f"✗ Creation failed: {response.status_code}")
-        print(f"  Error: {response.text}")
-except Exception as e:
-    print(f"✗ Workflow creation failed: {e}")
+        raise SystemExit(f"✗ Approver registration failed: {register.status_code} {register.text}")
 
-## Step 4: List All Resources
-print_section("STEP 4: View System State")
+    assign_role = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("assign_role.py")),
+         "--email", APPROVER_EMAIL, "--role", "approver"],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    output = (assign_role.stdout + assign_role.stderr).strip()
+    print(f"  assign_role.py: {output}")
+    if assign_role.returncode != 0:
+        raise SystemExit("✗ Could not grant the approver role; is .env configured?")
 
-# List workflows
-try:
-    response = requests.get(f"{BASE_URL}/api/v1/workflows/")
-    workflows = response.json()
-    print(f"✓ Total workflows: {len(workflows)}")
-    for wf in workflows:
-        print(f"  - {wf['name']} ({wf['status']}) - {len(wf['steps'])} steps")
-except Exception as e:
-    print(f"✗ Failed to list workflows: {e}")
+    return login(APPROVER_EMAIL, APPROVER_PASSWORD)
 
-# List documents
-try:
-    response = requests.get(f"{BASE_URL}/api/v1/documents/")
-    documents = response.json()
-    print(f"\n✓ Total documents: {len(documents)}")
-    for doc in documents:
-        print(f"  - {doc['filename']} ({doc['domain']}) - {doc['chunk_count']} chunks")
-except Exception as e:
-    print(f"✗ Failed to list documents: {e}")
 
-print_section("DEMONSTRATION COMPLETE")
-print("✓ System is operational and ready for execution!")
-print("\n📚 Next steps:")
-print("  1. Implement LangGraph execution engine")
-print("  2. Create workflow runs")
-print("  3. Test replay functionality")
-print("  4. Add authentication")
-print("\n📖 See API_TESTING.md for more examples")
-print("📖 See walkthrough.md for architecture details")
+def seed_rules(token: str) -> None:
+    """Get-or-create every rule this workflow references, via the rules API."""
+    existing = {rule["name"] for rule in api("GET", "/rules", token=token, expect=200)}
+    for name, rule in RULES.items():
+        if name in existing:
+            print(f"  = Rule '{name}' already exists")
+            continue
+        api("POST", "/rules", token=token, expect=201, json=rule)
+        print(f"  ✓ Created rule '{name}' (active version 1)")
+
+
+def poll_run(run_id: uuid.UUID, token: str, while_status: str, until_status: str) -> dict:
+    """Poll GET /runs/{id} until the status leaves `while_status`."""
+    deadline = time.monotonic() + POLL_TIMEOUT_S
+    run = api("GET", f"/runs/{run_id}", token=token, expect=200)
+    while run["status"] == while_status:
+        if time.monotonic() > deadline:
+            raise SystemExit(f"✗ Timed out waiting for the run to leave {while_status}")
+        time.sleep(POLL_INTERVAL_S)
+        run = api("GET", f"/runs/{run_id}", token=token, expect=200)
+    print(f"  Run status: {run['status']}" + ("" if run["status"] == until_status else f" (expected {until_status})"))
+    return run
+
+
+def main() -> None:
+    if urlparse(BASE_URL).scheme not in ("http", "https"):
+        raise SystemExit(f"✗ Invalid DEMO_BASE_URL: {BASE_URL!r}")
+    print_section("STEP 1 — Login as seeded admin (admin bypasses role checks)")
+    print(f"  Defaults: DEMO_EMAIL={ADMIN_EMAIL!r} DEMO_PASSWORD set via env or "
+          f"seed.py's admin@acmebank.com / admin123")
+    admin_token, admin = login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    print(f"  ✓ Logged in as {admin['email']} (id {admin['id']})")
+
+    print_section("STEP 2 — Create approver user + grant approver role")
+    approver_token, approver = ensure_approver_user()
+    print(f"  ✓ Approver ready: {approver['email']} (id {approver['id']})")
+
+    print_section("STEP 3 — Seed rules referenced by the workflow's rule steps")
+    seed_rules(admin_token)
+
+    print_section("STEP 4 — Create offline-capable workflow "
+                  "(CONDITIONAL gate → DOMAIN_RULE branches → HUMAN_APPROVAL join)")
+    workflow = api("POST", "/workflows/draft", token=admin_token, expect=201, json={
+        "name": f"Demo Risk Workflow ({uuid.uuid4().hex[:8]})",
+        "description": "demo.py: rule-gated branching with a human approval pause",
+        "domain": "demo",
+        "steps": STEPS,
+    })
+    workflow_id = workflow["id"]
+    print(f"  ✓ Created workflow {workflow_id}")
+    print(f"    status={workflow['status']} steps={[s['name'] for s in workflow['steps']]}")
+    print(f"    created_by={workflow['created_by']} (equals the JWT caller id above)")
+
+    print_section("STEP 5 — Approver freezes (approves) the workflow definition")
+    workflow = api("POST", f"/workflows/{workflow_id}/approve", token=approver_token, expect=200)
+    print(f"  ✓ Workflow status: {workflow['status']} approved_by={workflow['approved_by']}")
+
+    print_section("STEP 6 — Start a run (202 Accepted, executed by a background task)")
+    run = api("POST", "/runs/", token=admin_token, expect=202, json={
+        "workflow_id": workflow_id,
+        "account_id": f"ACC_DEMO_{uuid.uuid4().hex[:8]}",
+        "input_data": INPUT_DATA,
+        "trigger_reason": "demo.py walkthrough",
+    })
+    run_id = run["id"]
+    print(f"  ✓ HTTP 202; run {run_id} status={run['status']}")
+    print("  Polling until the run leaves RUNNING ...")
+    run = poll_run(run_id, admin_token, while_status="RUNNING", until_status="PAUSED")
+    if run["status"] != "PAUSED":
+        raise SystemExit(f"✗ Run ended as {run['status']} instead of pausing at the "
+                         f"approval step; error_message={run.get('error_message')}")
+    print("  ✓ Run is PAUSED: a real persisted approval gate with a pending node row")
+
+    print_section("STEP 7 — Approver approves the paused run (compare-and-swap resume)")
+    run = api("POST", f"/runs/{run_id}/approve", token=approver_token, expect=200,
+              json={"notes": "Approved by demo.py walkthrough"})
+    print(f"  ✓ Approve accepted; status={run['status']}")
+    run = poll_run(run_id, admin_token, while_status=run["status"], until_status="COMPLETED")
+    if run["status"] != "COMPLETED":
+        raise SystemExit(f"✗ Run finished as {run['status']}: "
+                         f"error_message={run.get('error_message')}")
+
+    print_section("STEP 8 — Node executions (per-node input/output snapshots)")
+    for execution in api("GET", f"/runs/{run_id}/executions", token=admin_token, expect=200):
+        print(f"  - {execution['node_type']:<14} {execution['status']:<9} "
+              f"out={json.dumps(execution['output_snapshot'], default=str)}")
+
+    print_section("STEP 9 — Final run output_data (terminal decision output)")
+    print(json.dumps(run.get("output_data"), indent=2, default=str))
+    print(f"\n✓ Walkthrough complete: run {run_id} COMPLETED")
+
+
+if __name__ == "__main__":
+    main()
