@@ -11,6 +11,14 @@ services:
       DOCUMENTS_DIR: ${DOCUMENTS_DIR:-/data/documents}
       # The entrypoint runs Alembic; do not also create_all() on startup.
       AUTO_CREATE_SCHEMA: "false"
+      # First-run seeding: RBAC roles + bootstrap admin + demo rules.
+      # Override in .env (SEED_ON_STARTUP=false) for a credential-free startup.
+      SEED_ON_STARTUP: ${SEED_ON_STARTUP:-true}
+      SEED_DEMO_RULES: ${SEED_DEMO_RULES:-true}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@acmebank.com}
+      # If BOOTSTRAP_ADMIN_PASSWORD is unset the entrypoint generates a random
+      # password and prints it ONCE to the container log — change it at once.
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
     ports:
       # Loopback only: public ingress goes through the Cloudflare Tunnel.
       - "127.0.0.1:8000:8000"

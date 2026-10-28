@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import secrets
+
 from sqlalchemy.engine import make_url
 
 # The app package lives at the image WORKDIR (/app); make it importable even
@@ -120,10 +122,71 @@ def run_migrations() -> None:
     )
 
 
+_FALSY = {"0", "false", "no", "off", ""}
+
+DEFAULT_ADMIN_EMAIL = "admin@acmebank.com"
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().strip("'\"").lower() not in _FALSY
+
+
+def run_seed() -> None:
+    """Seed RBAC roles, the bootstrap admin, and demo rules when enabled.
+
+    Controlled by SEED_ON_STARTUP (default false). The admin identity comes
+    from BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD; when the password is
+    unset a random one is generated and printed exactly once with a loud
+    warning (no persistent secrets live in the container). An admin that
+    already exists is left untouched — credentials are never reset here.
+    """
+    if not _flag("SEED_ON_STARTUP", False):
+        print("[entrypoint] SEED_ON_STARTUP is false; skipping seed")
+        return
+
+    from scripts.seed import bootstrap, generate_password
+
+    email = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip() or DEFAULT_ADMIN_EMAIL
+    password = os.environ.get("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    generated = not password
+    if generated:
+        password = generate_password()
+
+    summary = bootstrap(
+        email=email,
+        password=password,
+        include_demo_rules=_flag("SEED_DEMO_RULES", True),
+    )
+    demo_rules_requested = _flag("SEED_DEMO_RULES", True)
+
+    if summary["admin_created"]:
+        if generated:
+            print("!==================================================================!")
+            print("!  FIRST-ADMIN BOOTSTRAP PASSWORD (printed once, not stored again)  !")
+            print(f"!  Login: {email}")
+            print(f"!  Password: {password}")
+            print("!  CHANGE THIS PASSWORD IMMEDIATELY after first login.              !")
+            print("!==================================================================!")
+        else:
+            print(f"[entrypoint] created bootstrap admin {email} "
+                  "(password taken from BOOTSTRAP_ADMIN_PASSWORD)")
+    else:
+        print(f"[entrypoint] bootstrap admin {email} already exists; "
+              "credentials unchanged")
+    if summary["rules_created"]:
+        print("[entrypoint] demo rules seeded: " + ", ".join(summary["rules_created"]))
+    elif demo_rules_requested:
+        print("[entrypoint] demo rules already present")
+
+
 def main() -> None:
     owns_storage = prepare_storage()
     drop_privileges(owns_storage)
     run_migrations()
+    run_seed()
 
     if len(sys.argv) < 2:
         sys.exit("[entrypoint] no command supplied")

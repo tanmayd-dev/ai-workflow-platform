@@ -32,6 +32,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY alembic.ini .
 COPY alembic alembic/
 COPY app app/
+COPY scripts scripts/
 COPY docker/entrypoint.py /usr/local/bin/entrypoint.py
 RUN chmod 0755 /usr/local/bin/entrypoint.py
 
