@@ -439,11 +439,28 @@ class WorkflowExecutor:
                     await db.commit()
             raise
 
+    @staticmethod
+    def _actor_role(user: Optional[User]) -> Optional[str]:
+        """Formatted role string for audit rows (comma-joined, lowercase).
+
+        Mirrors how ``require_roles`` compares role names. ``None`` when the
+        actor's roles are unknown so the audit row simply omits the claim.
+        """
+        if user is None:
+            return None
+        names = sorted({
+            link.role.name.strip().lower()
+            for link in user.user_roles or []
+            if link is not None and link.role is not None and link.role.name
+        })
+        return ",".join(names) or None
+
     async def resume(
         self,
         run_id: UUID,
         verdict: Dict[str, Any],
-        db: AsyncSession
+        db: AsyncSession,
+        user: Optional[User] = None
     ) -> WorkflowRun:
         """
         Resume execution from the paused approval node using the stored snapshot,
@@ -453,6 +470,8 @@ class WorkflowExecutor:
             run_id: ID of the paused run
             verdict: Human verdict dict (e.g. {"approved": True, "approver": ...})
             db: Database session
+            user: Authenticated user approving the run; the "resumed"/"approved"
+                audit rows carry this actor instead of run.triggered_by
 
         Returns:
             WorkflowRun with execution results
@@ -480,6 +499,11 @@ class WorkflowExecutor:
 
         run_pk = run.id
 
+        # The real approver, not the run triggerer, is the actor of the
+        # resume-side audit rows (mirrors how reject() takes the rejecting user).
+        actor_id = getattr(user, "id", None) or run.triggered_by
+        actor_role = self._actor_role(user)
+
         result = await db.execute(
             select(WorkflowDefinition)
             .where(WorkflowDefinition.id == run.workflow_id)
@@ -505,7 +529,13 @@ class WorkflowExecutor:
         pending_node_exec = result.scalar_one_or_none()
 
         try:
-            await self._audit_run(db, run, "resumed")
+            await self._audit_run(
+                db,
+                run,
+                "resumed",
+                actor_id=actor_id,
+                actor_role=actor_role,
+            )
             rule_logics, rule_version_ids = await self._resolve_rule_logics(db, workflow)
             human_verdicts = {paused_step.name: verdict}
             graph = self.compiler.compile(
@@ -531,7 +561,12 @@ class WorkflowExecutor:
                         pending_node_exec.output_snapshot = self._step_output(step, final_state)
                         pending_node_exec.completed_at = datetime.utcnow()
                         await self._audit_node(
-                            db, run, pending_node_exec, step, "approved"
+                            db,
+                            run,
+                            pending_node_exec,
+                            step,
+                            "approved",
+                            actor_id=actor_id,
                         )
                     else:
                         await self._persist_step(
@@ -551,6 +586,8 @@ class WorkflowExecutor:
                 db,
                 run,
                 "approved",
+                actor_id=actor_id,
+                actor_role=actor_role,
                 details={
                     "step_id": str(paused_step.id),
                     "step_name": paused_step.name,
@@ -572,7 +609,12 @@ class WorkflowExecutor:
                 pending_node_exec.output_snapshot = verdict
                 pending_node_exec.completed_at = datetime.utcnow()
                 await self._audit_node(
-                    db, run, pending_node_exec, paused_step, "approved"
+                    db,
+                    run,
+                    pending_node_exec,
+                    paused_step,
+                    "approved",
+                    actor_id=actor_id,
                 )
 
             for step in sorted_steps:

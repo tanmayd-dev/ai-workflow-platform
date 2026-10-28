@@ -1,6 +1,6 @@
 """API v1 router aggregation."""
 from fastapi import APIRouter
-from app.api.v1.endpoints import documents, workflows, intents, runs, auth, rules
+from app.api.v1.endpoints import documents, workflows, intents, runs, auth, rules, audit
 
 api_router = APIRouter()
 
@@ -13,3 +13,4 @@ api_router.include_router(workflows.router, prefix="/workflows", tags=["workflow
 api_router.include_router(rules.router, prefix="/rules", tags=["rules"])
 api_router.include_router(intents.router, prefix="/intents", tags=["intents"])
 api_router.include_router(runs.router, prefix="/runs", tags=["runs"])
+api_router.include_router(audit.router, prefix="/audit-logs", tags=["audit"])

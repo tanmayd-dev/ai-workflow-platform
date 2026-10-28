@@ -208,6 +208,19 @@ class RunResponse(BaseModel):
         from_attributes = True
 
 
+class AuditLogResponse(BaseModel):
+    entity_type: str
+    entity_id: UUID
+    action: str
+    actor_id: UUID
+    actor_role: Optional[str] = None
+    details: Optional[Any] = None
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class NodeExecutionResponse(BaseModel):
     id: UUID
     node_type: str

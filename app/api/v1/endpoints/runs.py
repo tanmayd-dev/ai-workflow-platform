@@ -1,7 +1,7 @@
 """Workflow execution endpoints."""
 import logging
 from datetime import datetime
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
@@ -173,6 +173,58 @@ async def create_run(
     return run
 
 
+@router.get("", response_model=List[RunResponse])
+async def list_runs(
+    status: Optional[str] = None,
+    workflow_id: Optional[UUID] = None,
+    account_id: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    List runs newest-first with optional filters (any authenticated user).
+
+    This is how an approver discovers the runs waiting on them. Filters:
+    - ``status``: comma-separated (e.g. ``PAUSED`` or ``RUNNING,PAUSED``)
+    - ``workflow_id``: runs of one workflow definition
+    - ``account_id``: runs for one account
+
+    ``limit`` caps the page (default 50, max 200) and ``offset`` pages through
+    the newest-first ordering (started_at desc, id desc as tiebreak).
+    """
+    query = select(WorkflowRun)
+
+    if status:
+        parsed_statuses = []
+        for token in status.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                parsed_statuses.append(RunStatus[token.upper()])
+            except KeyError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown run status: {token}",
+                )
+        if parsed_statuses:
+            query = query.where(WorkflowRun.status.in_(parsed_statuses))
+
+    if workflow_id:
+        query = query.where(WorkflowRun.workflow_id == workflow_id)
+    if account_id:
+        query = query.where(WorkflowRun.account_id == account_id)
+
+    query = query.order_by(
+        WorkflowRun.started_at.desc(), WorkflowRun.id.desc()
+    ).limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
 @router.get("/{run_id}", response_model=RunResponse)
 async def get_run(
     run_id: UUID,
@@ -238,7 +290,8 @@ async def approve_run(
         run = await executor.resume(
             run_id=run_id,
             verdict=verdict,
-            db=db
+            db=db,
+            user=current_user
         )
     except ValueError as ve:
         # Claim lost in a race (or raced past the pre-check): this request's
