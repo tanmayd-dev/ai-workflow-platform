@@ -88,6 +88,15 @@ def _create_rule(client: TestClient, headers: dict):
     })
 
 
+def _upload_document(client: TestClient, headers: dict):
+    return client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("policy.txt", b"policy text", "text/plain")},
+        data={"domain": "fraud"},
+    )
+
+
 def _start_run(client: TestClient, headers: dict, workflow_id: str):
     return client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": workflow_id,
@@ -305,3 +314,45 @@ def test_role_names_are_case_insensitive(client):
     """A role stored as 'AUTHOR' satisfies require_roles('author')."""
     user = _register(client, ["AUTHOR"])
     assert _draft_workflow(client, user["headers"]).status_code == 201
+
+
+def test_get_document_by_id_returns_metadata_for_any_authenticated_user(client, monkeypatch):
+    """Upload as author, then GET /documents/{id} returns 200 with correct fields.
+
+    The path parameter is a UUID (Document.id is a PG UUID column), so it must
+    round-trip through the response without a 500.
+    """
+    # Document upload ingestion runs the real embedding pipeline; mock it the
+    # way test_intent_drafting mocks the RAG layer (chunk_count is asserted).
+    async def fake_ingest_document(self, content, document_id, filename, domain):
+        return 1
+
+    monkeypatch.setattr(
+        "app.services.rag_service.RAGService.ingest_document",
+        fake_ingest_document,
+    )
+
+    author = _register(client, ["author"])
+    upload = _upload_document(client, author["headers"])
+    assert upload.status_code == 201, upload.text
+    doc = upload.json()
+
+    # any authenticated user (no role required) can read it
+    reader = _register(client, roles=())
+    got = client.get(f"/api/v1/documents/{doc['id']}", headers=reader["headers"])
+    assert got.status_code == 200, got.text
+    body = got.json()
+    assert body["id"] == doc["id"]
+    assert body["filename"] == "policy.txt"
+    assert body["domain"] == "fraud"
+    assert body["file_size"] == len(b"policy text")
+    assert body["chunk_count"] == 1
+
+
+def test_get_document_malformed_uuid_returns_422(client):
+    """A malformed {id} fails UUID parsing with FastAPI's 422, not 500."""
+    user = _register(client, roles=())
+    response = client.get(
+        "/api/v1/documents/not-a-valid-uuid", headers=user["headers"]
+    )
+    assert response.status_code == 422, response.text
