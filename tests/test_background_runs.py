@@ -74,6 +74,34 @@ def _create_approved_workflow(
     return workflow_id
 
 
+def _create_rule(client: TestClient, headers: dict, rule_id: str) -> str:
+    """Create a minimal rule so approve-time validation passes; returns rule id."""
+    created = client.post("/api/v1/rules", headers=headers, json={
+        "name": rule_id,
+        "description": "test rule",
+        "domain": "fraud",
+        "logic_json": {
+            "field": "risk_score", "operator": ">=", "value": 0.8,
+            "result": "ESCALATE",
+        },
+    })
+    assert created.status_code == 201, created.text
+    return created.json()["id"]
+
+
+def _retract_rule(client: TestClient, headers: dict, rule_id: str) -> None:
+    """Admin-delete a rule after approval so it is unresolved at run time.
+
+    The approve-time gate requires referenced rules to exist when the workflow
+    is approved; these tests exercise the *run-time* failure path, so the rule
+    must vanish between approval and execution.
+    """
+    deleted = client.delete(
+        f"/api/v1/rules/{rule_id}", headers=headers, params={"force": "true"}
+    )
+    assert deleted.status_code == 204, deleted.text
+
+
 def _poll_until_terminal(
     client: TestClient,
     run_id: str,
@@ -324,6 +352,8 @@ def test_terminal_runs_do_not_block_new_runs(client, mock_llm):
     )["status"] == RunStatus.COMPLETED.value
 
     # A FAILED run is terminal too: the guard must not count it as active.
+    rule_id = f"bg_unresolved_rule_{uuid4().hex[:8]}"
+    rule_db_id = _create_rule(client, headers, rule_id)
     failing_workflow_id = _create_approved_workflow(
         client,
         headers,
@@ -331,11 +361,12 @@ def test_terminal_runs_do_not_block_new_runs(client, mock_llm):
         steps=[{
             "order_index": 0,
             "step_type": "DOMAIN_RULE",
-            "name": "Missing Rule Check",
-            "description": "References a rule that does not exist",
-            "config_json": {"rule_id": f"missing_rule_{uuid4().hex[:8]}"},
+            "name": "Unresolved Rule Check",
+            "description": "References a rule that is gone by run time",
+            "config_json": {"rule_id": rule_id},
         }],
     )
+    _retract_rule(client, headers, rule_db_id)
     failed_account = f"ACC_BG_FAILED_{uuid4().hex[:8]}"
     failed = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": failing_workflow_id,
@@ -359,7 +390,8 @@ def test_terminal_runs_do_not_block_new_runs(client, mock_llm):
 def test_background_failure_persists_failed_run_with_error_message(client, mock_llm):
     """An executor failure is durable: polling shows FAILED plus the reason."""
     headers = _register_and_login(client)
-    missing_rule = f"missing_rule_{uuid4().hex[:8]}"
+    rule_id = f"bg_failed_run_rule_{uuid4().hex[:8]}"
+    rule_db_id = _create_rule(client, headers, rule_id)
     workflow_id = _create_approved_workflow(
         client,
         headers,
@@ -375,12 +407,13 @@ def test_background_failure_persists_failed_run_with_error_message(client, mock_
             {
                 "order_index": 1,
                 "step_type": "DOMAIN_RULE",
-                "name": "Missing Rule Check",
-                "description": "References a rule that does not exist",
-                "config_json": {"rule_id": missing_rule},
+                "name": "Unresolved Rule Check",
+                "description": "References a rule that is gone by run time",
+                "config_json": {"rule_id": rule_id},
             },
         ],
     )
+    _retract_rule(client, headers, rule_db_id)
 
     created = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": workflow_id,
@@ -392,7 +425,7 @@ def test_background_failure_persists_failed_run_with_error_message(client, mock_
     final = _poll_until_terminal(client, created.json()["id"], headers)
     assert final["status"] == RunStatus.FAILED.value, final
     assert final["error_message"], "FAILED run must carry a durable error_message"
-    assert missing_rule in final["error_message"]
+    assert rule_id in final["error_message"] or "rule" in final["error_message"].lower()
 
 
 async def test_completed_run_output_data_matches_final_state_output(client, mock_llm):
@@ -435,6 +468,8 @@ async def test_completed_run_output_data_matches_final_state_output(client, mock
 def test_failed_run_output_data_is_none(client, mock_llm):
     """FAILED runs carry no output_data: no final decision output was produced."""
     headers = _register_and_login(client)
+    rule_id = f"bg_output_fail_rule_{uuid4().hex[:8]}"
+    rule_db_id = _create_rule(client, headers, rule_id)
     workflow_id = _create_approved_workflow(
         client,
         headers,
@@ -442,11 +477,12 @@ def test_failed_run_output_data_is_none(client, mock_llm):
         steps=[{
             "order_index": 0,
             "step_type": "DOMAIN_RULE",
-            "name": "Missing Rule Check",
-            "description": "References a rule that does not exist",
-            "config_json": {"rule_id": f"missing_rule_{uuid4().hex[:8]}"},
+            "name": "Unresolved Rule Check",
+            "description": "References a rule that is gone by run time",
+            "config_json": {"rule_id": rule_id},
         }],
     )
+    _retract_rule(client, headers, rule_db_id)
 
     created = client.post("/api/v1/runs/", headers=headers, json={
         "workflow_id": workflow_id,

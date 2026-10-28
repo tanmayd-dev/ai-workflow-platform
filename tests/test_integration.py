@@ -926,7 +926,7 @@ def test_racing_verdict_conflict_returns_409(client, approval_workflow, high_ris
     run_id = created.json()["id"]
     assert _wait_for_run(client, run_id, headers)["status"] == RunStatus.PAUSED.value
 
-    async def lost_claim_resume(self, run_id, verdict, db):
+    async def lost_claim_resume(self, run_id, verdict, db, user=None):
         raise ValueError(f"Run {run_id} is not in PAUSED status (current: RUNNING)")
 
     async def lost_claim_reject(self, run_id, reason, db, user=None):
