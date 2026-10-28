@@ -18,6 +18,19 @@ _SYNC_DRIVER_MAP = {
 }
 
 
+def parse_cors_origins(raw: str) -> list[str]:
+    """Parse the CSV ``CORS_ORIGINS`` setting into an explicit origin list.
+
+    Empty/blank entries are dropped. A wildcard (``"*"``) entry is dropped
+    too: Starlette forbids ``allow_origins=["*"]`` together with
+    ``allow_credentials=True``, so CORS is only enabled for an explicit
+    origin list — wildcard input therefore disables CORS rather than
+    permitting credentials to every origin.
+    """
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [origin for origin in origins if origin != "*"]
+
+
 def to_sync_database_url(url: str) -> str:
     """Return a synchronous SQLAlchemy URL derived from the app's async URL."""
     parsed = make_url(url)
@@ -50,6 +63,16 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # Debug: gates SQL statement echo (echo=True logs every query with bound
+    # parameters, e.g. run inputs and password hashes, to stdout). Keep false
+    # in production.
+    DEBUG: bool = False
+
+    # CORS: opt-in CSV of explicit browser origins, e.g.
+    # "http://localhost:3000,https://app.example.com". Empty (default) adds no
+    # CORS middleware. Wildcards are rejected by parse_cors_origins.
+    CORS_ORIGINS: str = ""
 
     # Vector Store
     CHROMA_DB_DIR: str = DEFAULT_CHROMA_DB_DIR

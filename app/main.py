@@ -1,7 +1,7 @@
 """Main FastAPI application."""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.config import get_settings
+from app.core.config import get_settings, parse_cors_origins
 from app.core.database import init_db
 from app.api.v1.api import api_router
 
@@ -14,14 +14,18 @@ app = FastAPI(
     description="AI-Governed Workflow Orchestration System for Regulated Banking Operations"
 )
 
-# CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is opt-in: set CORS_ORIGINS to a CSV of explicit origins. parse_cors_origins
+# drops wildcard ("*") entries, so CORSMiddleware is never configured with
+# allow_origins=["*"] and allow_credentials=True (an invalid combination).
+cors_origins = parse_cors_origins(settings.CORS_ORIGINS)
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Include API routers
 app.include_router(api_router, prefix=settings.API_V1_STR)

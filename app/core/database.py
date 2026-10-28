@@ -19,7 +19,9 @@ def get_engine() -> AsyncEngine:
         # to use across separate event loops (pytest + TestClient portals).
         _engine = create_async_engine(
             settings.DATABASE_URL,
-            echo=True,
+            # Echo logs every SQL statement with bound parameters (run inputs,
+            # password hashes); only enable it when DEBUG is on.
+            echo=settings.DEBUG,
             future=True,
             poolclass=NullPool,
         )
