@@ -393,3 +393,68 @@ def test_background_failure_persists_failed_run_with_error_message(client, mock_
     assert final["status"] == RunStatus.FAILED.value, final
     assert final["error_message"], "FAILED run must carry a durable error_message"
     assert missing_rule in final["error_message"]
+
+
+async def test_completed_run_output_data_matches_final_state_output(client, mock_llm):
+    """COMPLETED runs persist and expose the final step's output via GET /runs/{id}."""
+    headers = _register_and_login(client)
+    workflow_id = _create_approved_workflow(
+        client,
+        headers,
+        name="Background Output Data Workflow",
+        steps=[{
+            "order_index": 0,
+            "step_type": "AI_ANALYSIS",
+            "name": "Risk Analysis",
+            "description": "AI analyzes transaction risk",
+            "config_json": {"prompt_template": "Analyze this transaction"},
+        }],
+    )
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": workflow_id,
+        "account_id": f"ACC_BG_OUTPUT_{uuid4().hex[:8]}",
+        "input_data": {"risk_score": 0.4},
+    })
+    assert created.status_code == 202, created.text
+
+    final = _poll_until_terminal(client, created.json()["id"], headers)
+    assert final["status"] == RunStatus.COMPLETED.value, final
+
+    # The final state's current_output for an AI step is {"content": ...}.
+    expected_output = {"content": "MOCK-LLM ANALYSIS: transaction risk assessed"}
+    assert final["output_data"] == expected_output, final
+
+    # It is durable (read through an independent session), not transient.
+    async with get_session_maker()() as session:
+        persisted = await session.get(WorkflowRun, UUID(created.json()["id"]))
+        assert persisted is not None
+        assert persisted.output_data == expected_output
+
+
+def test_failed_run_output_data_is_none(client, mock_llm):
+    """FAILED runs carry no output_data: no final decision output was produced."""
+    headers = _register_and_login(client)
+    workflow_id = _create_approved_workflow(
+        client,
+        headers,
+        name="Background Output Failure Workflow",
+        steps=[{
+            "order_index": 0,
+            "step_type": "DOMAIN_RULE",
+            "name": "Missing Rule Check",
+            "description": "References a rule that does not exist",
+            "config_json": {"rule_id": f"missing_rule_{uuid4().hex[:8]}"},
+        }],
+    )
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": workflow_id,
+        "account_id": f"ACC_BG_OUTPUT_FAIL_{uuid4().hex[:8]}",
+        "input_data": {"risk_score": 0.5},
+    })
+    assert created.status_code == 202, created.text
+
+    final = _poll_until_terminal(client, created.json()["id"], headers)
+    assert final["status"] == RunStatus.FAILED.value, final
+    assert final["output_data"] is None, final

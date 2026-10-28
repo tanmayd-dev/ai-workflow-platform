@@ -37,6 +37,7 @@ class WorkflowRun(Base):
     # Workflow state data
     input_data = Column(JSON, nullable=True)  # Declared inputs, saved for replay
     state_snapshot = Column(JSON, nullable=True)  # Current graph state
+    output_data = Column(JSON, nullable=True)  # Final decision output (COMPLETED approval/replay paths)
     replayed_from_run_id = Column(UUID(as_uuid=True), nullable=True)  # Set when this run is a replay
     
     # Audit

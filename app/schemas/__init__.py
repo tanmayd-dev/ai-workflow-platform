@@ -199,7 +199,11 @@ class RunResponse(BaseModel):
     started_at: datetime
     completed_at: Optional[datetime]
     error_message: Optional[str] = None
-    
+    # Final decision output for terminal runs: the graph's current_output, which
+    # may be a dict (AI output, approval verdict) or a scalar (rule result).
+    # Validate as any JSON, not dict-only.
+    output_data: Optional[Any] = None
+
     class Config:
         from_attributes = True
 
