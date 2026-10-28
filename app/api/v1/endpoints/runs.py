@@ -246,9 +246,13 @@ async def approve_run(
         await db.refresh(run)
         raise HTTPException(status_code=409, detail=str(ve))
     except Exception:
-        logger.exception("Resume execution failed for run %s; returning FAILED run row", run_id)
-        await db.refresh(run)
-        return run
+        # The executor marks the run FAILED in its own error handling; the
+        # client gets a hard failure instead of a 200 wearing a FAILED body.
+        logger.exception("Resume execution failed for run %s; raising 500", run_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Executor failed while resuming run {run_id}; run is marked FAILED"
+        )
 
     return run
 
@@ -303,10 +307,12 @@ async def reject_run(
         raise HTTPException(status_code=409, detail=str(ve))
     except Exception:
         # The run row carries the outcome; a mid-flight executor failure lands
-        # here after refresh and reflects the row as it ended up.
-        logger.exception("Rejection execution failed for run %s; returning FAILED run row", run_id)
-        await db.refresh(run)
-        return run
+        # here and the client gets a hard failure, not a 200 with a FAILED body.
+        logger.exception("Rejection execution failed for run %s; raising 500", run_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Executor failed while rejecting run {run_id}; run is marked FAILED"
+        )
 
     return run
 

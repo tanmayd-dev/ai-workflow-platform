@@ -1116,3 +1116,50 @@ async def test_rule_version_constraints_enforced(db_session, sample_user):
         with pytest.raises(IE):
             await s.commit()
         await s.rollback()
+
+
+@pytest.mark.parametrize("action,method_name", [
+    ("approve", "resume"),
+    ("reject", "reject"),
+])
+def test_approve_reject_return_500_when_executor_crashes(
+    client, approval_workflow, high_risk_rule, mock_llm, monkeypatch, action, method_name
+):
+    """
+    If the executor blows up while applying a verdict (e.g. DB failure), the
+    client must get a 500 — not a 200 carrying a FAILED/paused run body — so a
+    crash is distinguishable from a verdict that was applied successfully.
+    """
+    email = f"crash_{action}_{uuid4()}@example.com"
+    client.post("/api/v1/auth/register", json={
+        "email": email, "password": "testpass123", "full_name": "Crash User"
+    })
+    grant_role(email, "admin")
+    login = client.post("/api/v1/auth/login", data={
+        "username": email, "password": "testpass123"
+    })
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    created = client.post("/api/v1/runs/", headers=headers, json={
+        "workflow_id": str(approval_workflow.id),
+        "account_id": f"ACC_CRASH_{action.upper()}",
+        "input_data": {"risk_score": 0.97},
+    })
+    assert created.status_code == 202, created.text
+    paused = _wait_for_run(client, created.json()["id"], headers)
+    assert paused["status"] == RunStatus.PAUSED.value
+    run_id = paused["id"]
+
+    async def crash(self, *args, **kwargs):
+        raise RuntimeError(f"simulated executor crash in {method_name}")
+
+    monkeypatch.setattr(WorkflowExecutor, method_name, crash)
+
+    if action == "approve":
+        resp = client.post(f"/api/v1/runs/{run_id}/approve", headers=headers, json={"notes": "ok"})
+    else:
+        resp = client.post(f"/api/v1/runs/{run_id}/reject", headers=headers)
+
+    assert resp.status_code == 500, resp.text
+    assert "Executor failed" in resp.json()["detail"]
+    assert str(run_id) in resp.json()["detail"]
