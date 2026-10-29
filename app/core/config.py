@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # storage settings (DOCUMENT_* naming).
     DOCUMENT_MAX_BYTES: int = 5 * 1024 * 1024
 
+    # Logging knobs (consumed by app.core.logging.configure_logging()).
+    LOG_LEVEL: str = "INFO"
+    # When false, plain-text lines (DEFAULT_LOG_FORMAT). When true, one JSON
+    # object per line (keys: ts/level/logger/request_id/message).
+    LOG_JSON: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = True
