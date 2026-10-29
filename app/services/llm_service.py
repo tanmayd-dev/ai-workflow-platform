@@ -158,13 +158,16 @@ Output a JSON object with the following structure:
   "steps": [
     {{
       "order_index": 0,
-      "step_type": "AI_ANALYSIS" | "DOMAIN_RULE" | "HUMAN_APPROVAL",
+      "step_type": "AI_ANALYSIS" | "DOMAIN_RULE" | "HUMAN_APPROVAL" | "CONDITIONAL",
       "name": "Step Name",
       "description": "What this step does",
       "config_json": {{
         "rag_query": "optional query for context retrieval",
         "rule_id": "optional rule reference",
-        "prompt_template": "template for AI nodes"
+        "prompt_template": "template for AI nodes",
+        "condition": "CONDITIONAL only: JSON-DSL condition object, e.g. {{\"field\": \"fraud_score\", \"operator\": \">\", \"value\": 0.8}}",
+        "on_true": "CONDITIONAL only: name of the step to run when the condition is met",
+        "on_false": "CONDITIONAL only: name of the step to run when the condition is NOT met"
       }}
     }}
   ]
@@ -174,14 +177,32 @@ Constraints:
 - MUST include at least one HUMAN_APPROVAL step
 - AI_ANALYSIS steps should specify rag_query for retrieving relevant regulations
 {rule_guidance}
+- WHEN the intent is conditional ("when X", "if X", "only if X above threshold"),
+  you MUST branch with a CONDITIONAL step instead of a straight line. Branch
+  layout the compiler enforces (ordered by order_index):
+    earlier steps → CONDITIONAL gate → true-branch steps (contiguous) →
+    ONE false-branch step → shared trailing steps.
+  Put the HUMAN_APPROVAL and the action steps inside the TRUE branch (the
+  earlier contiguous region), and finish the false branch with a single
+  terminal AI step that records NO_ACTION. Example for "suspend a card only
+  when fraud_score is above 0.8, with supervisor confirmation":
+    0 EvaluateFraudScore (AI_ANALYSIS, prompt_template demands the JSON contract)
+    1 CheckThreshold (CONDITIONAL, condition {{"field": "fraud_score", "operator": ">", "value": 0.8}},
+      on_true "SupervisorApproval", on_false "RecordNoAction")
+    2 SupervisorApproval (HUMAN_APPROVAL)
+    3 SuspendCard (AI_ANALYSIS ...)
+    4 RecordNoAction (AI_ANALYSIS, prompt_template: "Record that no action was required for this low-risk operation. Respond ONLY with compact JSON: ...applied\": false")
+  The condition evaluates against the run input plus earlier step outputs,
+  so a rule or AI step earlier in the chain supplies the score field.
 - If the intent describes an action that should apply once approved (e.g.
-  suspend a card, block a transaction, notify a team), add one final step
-  AFTER the HUMAN_APPROVAL step that records the applied action: an
-  AI_ANALYSIS step whose prompt_template instructs the executor to emit the
-  action record and echo the run input, e.g. prompt_template: "Record the
-  applied action for this decision and echo the account and transaction
-  identifiers from the input data." No action may apply before the human
-  approval step has completed.
+  suspend a card, block a transaction, notify a team), place that action step
+  in the TRUE branch after the HUMAN_APPROVAL step (see the branch layout
+  above): an AI_ANALYSIS step whose prompt_template instructs the executor to
+  emit the action record and echo the run input. No action may apply before
+  the human approval step has completed. The action step's prompt_template
+  MUST also carry the guard: "If the earlier analysis output NO_ACTION and
+  the supervisor notes do not explicitly instruct otherwise, respond with
+  action NO_ACTION and applied: false."
 - EVERY AI_ANALYSIS step's prompt_template MUST demand a compact JSON decision
   contract with exactly these keys: "action" (short machine-readable label,
   e.g. "SUSPEND_CARD", "BLOCK_TX", "REVIEW", "NO_ACTION"), "risk_tier"

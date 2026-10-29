@@ -5,6 +5,7 @@ Supports pausing at HUMAN_APPROVAL nodes, resuming with human verdicts, and
 condition-based branching at CONDITIONAL nodes.
 """
 import asyncio
+import json
 from typing import Dict, Any, List, Optional, Tuple
 from langchain_core.messages import BaseMessage
 from langgraph.graph import StateGraph, END
@@ -525,8 +526,23 @@ class WorkflowCompiler:
                         f"RAG retrieval failed for step '{step.name}': {e}"
                     )
 
-            # Build user prompt from template and input data
-            user_prompt = f"{prompt_template}\n\nInput Data:\n{state.input_data}"
+            # Build user prompt from template, input data, and what earlier
+            # steps decided. Prior outputs (and human verdicts) are included so
+            # a post-approval action step can honor the pre-approval analysis
+            # (e.g. NOT claim a suspension when the analysis said NO_ACTION).
+            prior_lines: List[str] = []
+            for name, output in state.ai_outputs.items():
+                content = output.get("content") if isinstance(output, dict) else output
+                prior_lines.append(f"Step {name} (AI): {content}")
+            for name, output in state.rule_outputs.items():
+                prior_lines.append(f"Step {name} (rule): {output}")
+            for name, output in state.human_approvals.items():
+                prior_lines.append(f"Step {name} (human): {json.dumps(output, default=str)}")
+            prior_block = ""
+            if prior_lines:
+                prior_block = "\n\nEarlier step outputs (honor these decisions):\n" + "\n".join(prior_lines)
+
+            user_prompt = f"{prompt_template}\n\nInput Data:\n{state.input_data}{prior_block}"
             
             # Call LLM with proper async and parameters
             result = await self.llm_service.generate_completion(
@@ -541,7 +557,12 @@ class WorkflowCompiler:
                     '- "risk_score": the numeric score this step evaluated (when input provides one)\n'
                     '- "summary": the decision reason in at most 160 characters\n'
                     '- "applied": true only when this step APPLIES an action after '
-                    'human approval, otherwise false'
+                    'human approval, otherwise false\n'
+                    "- NEVER claim an action was applied unless the intent admits it: "
+                    "if an earlier step's output concluded NO_ACTION (or a low "
+                    "risk_tier) and the human notes supplied above do not "
+                    "EXPLICITLY instruct otherwise, you must output "
+                    '"action": "NO_ACTION", "applied": false.'
                 ),
                 user_prompt=user_prompt,
                 context=context_text if context_text else None

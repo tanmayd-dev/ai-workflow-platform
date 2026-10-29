@@ -248,6 +248,8 @@ h3 {
 .verdict-banner[data-tone="green"] .verdict-action { color: #7bd8a2; }
 .verdict-banner[data-tone="amber"] .verdict-action { color: #e8b95d; }
 .v-summary { margin-top: 6px; font-size: 13px; color: var(--text); }
+.v-rec { margin-top: 8px; font-size: 13.5px; color: var(--text); }
+.v-rec strong { letter-spacing: .04em; }
 .v-chips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
 .vchip {
   font-family: var(--mono); font-size: 11px; color: var(--muted);

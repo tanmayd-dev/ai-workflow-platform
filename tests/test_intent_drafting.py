@@ -300,6 +300,17 @@ async def test_draft_workflow_sends_expected_prompt_contract(monkeypatch):
     assert result == {"content": json.dumps(VALID_DRAFT), "model_name": "mock-model"}
 
     system_prompt = captured["system_prompt"]
+
+    # Conditional branching ("when X ..."): the model must be able to draft
+    # CONDITIONAL gates, or conditional intents compile into straight-line
+    # workflows that suspend cards behind low fraud scores (issue seen live).
+    for key in ('"CONDITIONAL"', '"condition"', '"on_true"', '"on_false"',
+                "true-branch steps", "you MUST branch"):
+        assert key in system_prompt, key
+    # The action step carries the NO_ACTION guard against unconditional
+    # post-approval application.
+    assert "the supervisor notes do not explicitly instruct otherwise" in system_prompt
+
     assert "expert workflow designer" in system_prompt
     assert f"Domain: {DOMAIN}" in system_prompt
     # The expected output schema is spelled out for the model.

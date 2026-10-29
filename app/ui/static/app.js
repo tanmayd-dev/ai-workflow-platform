@@ -653,9 +653,13 @@ function verdictChips(verdict, run) {
   return chips.join("");
 }
 
-/* Runs-table outcome cell: big colored action badge, or fallback pill when no
-   decision contract exists yet (mock/legacy runs). */
+/* Runs-table outcome cell: big colored action badge; PAUSED runs read
+   "REVIEW" (amber) instead of the pre-approval AI contract, which is not a
+   decision — approve/reject has not happened yet. */
 function outcomeCell(run) {
+  if (run.status === "PAUSED") {
+    return '<span class="verdict-badge" data-tone="amber">REVIEW</span>';
+  }
   const verdict = runDecision(run);
   if (verdict && verdict.action) {
     const tone = verdictTone(verdict, run);
@@ -664,9 +668,63 @@ function outcomeCell(run) {
   return '<span class="muted">—</span>';
 }
 
+/* JSON decision-contract parser (JS port of the executor's tolerant extractor). */
+function parseEmbeddedJson(text) {
+  if (typeof text !== "string") return null;
+  let cleaned = text.trim();
+  for (const fence of ["```json", "```"]) {
+    if (cleaned.includes(fence)) { cleaned = cleaned.split(fence)[1].split("```")[0].trim(); break; }
+  }
+  try { const p = JSON.parse(cleaned); return (p && typeof p === "object") ? p : null; }
+  catch { /* keep trying */ }
+  const start = cleaned.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < cleaned.length; i++) {
+    if (cleaned[i] === "{") depth++;
+    else if (cleaned[i] === "}") { depth--; if (depth === 0) {
+      try { const p = JSON.parse(cleaned.slice(start, i + 1)); return (p && typeof p === "object") ? p : null; }
+      catch { return null; }
+    } }
+  }
+  return null;
+}
+
+/* Pre-approval AI recommendation (applied=false contract from an earlier AI step). */
+function aiRecommendation(run) {
+  const out = run.output_data;
+  if (!out || typeof out !== "object" || !out.ai_analysis) return null;
+  for (const stepOut of Object.values(out.ai_analysis)) {
+    const parsed = parseEmbeddedJson(stepOut && stepOut.content);
+    if (parsed && typeof parsed.action === "string" && parsed.applied !== true) return parsed;
+  }
+  return null;
+}
+
 /* Drawer banner: half-second glanceability for the decision + its context. */
 function renderVerdictBanner(run) {
   const box = $("#run-d-verdict");
+
+  if (run.status === "PAUSED") {
+    const rec = aiRecommendation(run);
+    let recLine = "";
+    if (rec) {
+      const score = rec.risk_score !== undefined && rec.risk_score !== null ? ` · ${esc(String(rec.risk_score))}` : "";
+      recLine = `<div class="v-rec">AI recommendation: <strong>${esc(String(rec.action).toUpperCase())}</strong>${rec.risk_tier ? ` · risk ${esc(String(rec.risk_tier).toUpperCase())}${score}` : ""}${rec.summary ? `<div class="v-summary">${esc(rec.summary)}</div>` : ""}</div>`;
+    }
+    const chips = [];
+    if (run.account_id) chips.push(`<span class="vchip">account ${esc(run.account_id)}</span>`);
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="verdict-banner" data-tone="amber">
+        <div class="verdict-action">🟡 AWAITING SUPERVISOR REVIEW</div>
+        ${recLine || '<div class="v-rec">No prior AI analysis recorded for this pause.</div>'}
+        <div class="v-chips">${chips.join("")}</div>
+        <div class="v-note-by">Decide with this recommendation in mind — Approve continues the branch, Reject ends the run.</div>
+      </div>`;
+    return;
+  }
+
   const verdict = runDecision(run);
   const reviews = (run.output_data && run.output_data.human_reviews) || {};
   const lastReviewKey = Object.keys(reviews).pop();
@@ -674,13 +732,11 @@ function renderVerdictBanner(run) {
   const tone = verdictTone(verdict, run);
   const icon = tone === "red" ? "🔴" : tone === "green" ? "🟢" : tone === "amber" ? "🟡" : "⚪";
 
-  let action;
-  if (verdict && verdict.action) action = String(verdict.action).toUpperCase();
-  else if (run.status === "PAUSED") action = "AWAITING SUPERVISOR REVIEW";
-  else {
+  if (!(verdict && verdict.action)) {
     box.hidden = true;
     return;
   }
+  const action = String(verdict.action).toUpperCase();
 
   const chips = verdict ? verdictChips(verdict, run) : "";
   const reviewer = review ? (review.approver ? ` by ${review.approver}` : "") : "";
