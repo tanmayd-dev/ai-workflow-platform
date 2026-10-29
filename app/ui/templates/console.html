@@ -85,8 +85,10 @@
         </div>
         <div class="intent-result" id="intent-result" hidden>
           <div class="draft-head">
-            <label for="intent-name">Proposed name (editable)</label>
-            <input id="intent-name" spellcheck="false">
+            <div class="draft-name">
+              <label for="intent-name">Proposed name (editable)</label>
+              <input id="intent-name" spellcheck="false">
+            </div>
             <button id="intent-create-btn" class="btn primary" type="button">Create as DRAFT</button>
           </div>
           <div class="mono-block"><pre id="intent-draft-json"></pre></div>
@@ -214,10 +216,12 @@
       <div id="run-d-error" class="form-error" hidden></div>
       <div class="meta-grid mono" id="run-d-meta"></div>
       <div id="run-d-error-message" class="error-note mono" hidden></div>
+      <h3>Input</h3>
+      <div class="mono-block"><pre id="run-d-input">—</pre></div>
       <h3>Output</h3>
       <div class="mono-block"><pre id="run-d-output">—</pre></div>
       <div class="drawer-actions" id="run-d-actions" hidden>
-        <input id="run-d-note" spellcheck="false" placeholder="Reason / notes (optional)">
+        <input id="run-d-note" spellcheck="false" placeholder="Decision notes — recorded in the run output (recommended)">
         <div class="pair">
           <button id="run-d-approve" class="btn primary" type="button">Approve</button>
           <button id="run-d-reject" class="btn danger" type="button">Reject</button>

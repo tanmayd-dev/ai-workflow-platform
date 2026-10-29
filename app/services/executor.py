@@ -438,6 +438,33 @@ class WorkflowExecutor:
             rule_evaluation_result=rule_evaluation_result,
         )
 
+    @staticmethod
+    def _compose_run_output(state: WorkflowState, outcome: str) -> Dict[str, Any]:
+        """Composite run outcome replacing the raw last-node output.
+
+        previously ``run.output_data`` was only ``state.current_output`` —
+        whatever the terminal node produced (often just the approval verdict).
+        Two runs whose humans reviewed different operations then showed
+        byte-identical output. The composite keeps ``last_step_output`` and
+        adds what every layer decided: the run input, AI analyses, rule
+        evaluations, branch decisions and human reviews.
+        """
+        composite: Dict[str, Any] = {
+            "outcome": outcome,
+            "last_step_output": state.current_output,
+        }
+        if state.input_data:
+            composite["input"] = state.input_data
+        if state.ai_outputs:
+            composite["ai_analysis"] = state.ai_outputs
+        if state.rule_outputs:
+            composite["rule_results"] = state.rule_outputs
+        if state.human_approvals:
+            composite["human_reviews"] = state.human_approvals
+        if state.conditional_outputs:
+            composite["branch_decisions"] = state.conditional_outputs
+        return composite
+
     async def _persist_step(
         self,
         db: AsyncSession,
@@ -594,7 +621,7 @@ class WorkflowExecutor:
             # Update run status
             run.status = RunStatus.COMPLETED
             run.completed_at = datetime.utcnow()
-            run.output_data = final_state.current_output
+            run.output_data = self._compose_run_output(final_state, "COMPLETED")
             run.state_snapshot = final_state.model_dump()
             # Terminal CAS FIRST: status-affecting ORM mutations are deferred
             # until the claim is won, so no mid-transaction flush (e.g. from
@@ -605,7 +632,7 @@ class WorkflowExecutor:
 
             run.status = RunStatus.COMPLETED
             run.completed_at = datetime.utcnow()
-            run.output_data = final_state.current_output
+            run.output_data = self._compose_run_output(final_state, "COMPLETED")
             run.state_snapshot = final_state.model_dump()
             run.current_step_index = sorted_steps[-1].order_index if sorted_steps else 0
             await self._audit_run(db, run, "completed")
@@ -646,7 +673,7 @@ class WorkflowExecutor:
             run.status = RunStatus.PAUSED
             run.current_step_index = paused_step.order_index
             run.state_snapshot = pause_state.model_dump()
-            run.output_data = pause_state.current_output
+            run.output_data = self._compose_run_output(pause_state, "PAUSED")
             await self._audit_run(
                 db,
                 run,
@@ -853,7 +880,10 @@ class WorkflowExecutor:
 
             run.status = RunStatus.COMPLETED
             run.completed_at = datetime.utcnow()
-            run.output_data = final_state.current_output
+            run.output_data = self._compose_run_output(
+                final_state,
+                "APPROVED" if verdict.get("approved", True) else "REJECTED",
+            )
             run.state_snapshot = final_state.model_dump()
             run.current_step_index = sorted_steps[-1].order_index if sorted_steps else paused_step.order_index
             await self._audit_run(
@@ -911,7 +941,7 @@ class WorkflowExecutor:
             run.status = RunStatus.PAUSED
             run.current_step_index = new_paused_step.order_index
             run.state_snapshot = new_pause_state.model_dump()
-            run.output_data = new_pause_state.current_output
+            run.output_data = self._compose_run_output(new_pause_state, "PAUSED")
             await self._audit_run(
                 db,
                 run,

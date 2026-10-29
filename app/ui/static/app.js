@@ -600,6 +600,30 @@ function startRunPoll() {
   }, 3000);
 }
 
+/* One-line human-readable summary for an execution row (details stay under
+   Snapshots/JSON). Structure-tolerant: works with dict or scalar outputs. */
+function execHint(x) {
+  const o = x.output_snapshot;
+  if (o === null || o === undefined) return "";
+  const out = (typeof o === "object") ? o : { value: o };
+  if (out.approved !== undefined) {
+    const verb = out.approved ? "Approved" : "Rejected";
+    const by = out.approver ? ` by ${out.approver}` : "";
+    const note = (out.notes || out.reason) ? ` — ${out.notes || out.reason}` : "";
+    return `${verb}${by}${note}`;
+  }
+  if (out.condition_met !== undefined) {
+    return out.next ? `Branch → ${out.next}` : `Condition ${out.condition_met ? "met" : "not met"}`;
+  }
+  if (out.rule !== undefined && Object.keys(out).length === 1) return "Rule referenced, not evaluated";
+  if (out.content !== undefined) return String(out.content).slice(0, 140);
+  if (x.rule_evaluation_result !== null && x.rule_evaluation_result !== undefined) {
+    return `Rule result: ${JSON.stringify(x.rule_evaluation_result)}`;
+  }
+  const text = typeof o === "string" ? o : JSON.stringify(o);
+  return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+}
+
 async function refreshRunPanel(keepScroll = false) {
   const id = currentRunId;
   if (!id) return;
@@ -631,6 +655,10 @@ async function refreshRunPanel(keepScroll = false) {
   errEl.hidden = !run.error_message;
   errEl.textContent = run.error_message || "";
 
+  $("#run-d-input").textContent =
+    pretty((run.output_data && typeof run.output_data === "object" && !Array.isArray(run.output_data))
+      ? run.output_data.input : undefined);
+
   $("#run-d-output").textContent = pretty(run.output_data);
 
   $("#run-d-actions").hidden = run.status !== "PAUSED";
@@ -644,6 +672,7 @@ async function refreshRunPanel(keepScroll = false) {
         <span class="pill" data-status="${esc(x.status)}">${esc(x.status)}</span>
       </div>
       <div class="tl-time">${esc(fmtTime(x.started_at))} → ${esc(fmtTime(x.completed_at))}</div>
+      ${execHint(x) ? `<div class="exec-hint">${esc(execHint(x))}</div>` : ""}
       ${x.error_message ? `<div class="tl-error">✗ ${esc(x.error_message)}</div>` : ""}
       <details class="snap"><summary>Snapshots/JSON</summary>
         ${x.prompt_snapshot ? `<div class="mono-inline">prompt</div><pre>${esc(x.prompt_snapshot)}</pre>` : ""}

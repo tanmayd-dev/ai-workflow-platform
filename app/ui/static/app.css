@@ -225,6 +225,11 @@ h3 {
 }
 .draft-head label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
 .draft-head input { font-family: var(--mono); width: 100%; }
+.draft-name { min-width: 0; }
+.exec-hint {
+  margin: 4px 0 2px; color: var(--muted); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .mono-block {
   background: var(--surface); border: 1px solid var(--hairline);
   border-radius: var(--radius); overflow: auto; max-height: 420px;

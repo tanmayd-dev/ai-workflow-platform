@@ -454,15 +454,90 @@ async def test_completed_run_output_data_matches_final_state_output(client, mock
     final = _poll_until_terminal(client, created.json()["id"], headers)
     assert final["status"] == RunStatus.COMPLETED.value, final
 
-    # The final state's current_output for an AI step is {"content": ...}.
-    expected_output = {"content": "MOCK-LLM ANALYSIS: transaction risk assessed"}
-    assert final["output_data"] == expected_output, final
+    # output_data is a composite outcome: what was decided (last step), what
+    # the input was, and what every analysis layer produced.
+    out = final["output_data"]
+    assert out["outcome"] == "COMPLETED", out
+    assert out["input"] == {"risk_score": 0.4}, out
+    assert out["last_step_output"] == {"content": "MOCK-LLM ANALYSIS: transaction risk assessed"}, out
+    analysis = out["ai_analysis"]["Risk Analysis"]
+    assert analysis["content"] == "MOCK-LLM ANALYSIS: transaction risk assessed"
+    assert analysis["model_name"] == "mock-model"
 
     # It is durable (read through an independent session), not transient.
     async with get_session_maker()() as session:
         persisted = await session.get(WorkflowRun, UUID(created.json()["id"]))
         assert persisted is not None
-        assert persisted.output_data == expected_output
+        assert persisted.output_data["outcome"] == "COMPLETED"
+        assert persisted.output_data["input"] == {"risk_score": 0.4}
+
+
+def test_two_runs_with_different_reviews_have_different_outputs(client, mock_llm):
+    """Regression: two completed runs of the same workflow whose humans reviewed
+    different operations used to expose byte-identical output_data (only the
+    raw approval verdict survived). The composite outcome must carry the run
+    input, the AI analysis and the human verdict, so the two runs differ."""
+    headers = _register_and_login(client)
+    workflow_id = _create_approved_workflow(
+        client,
+        headers,
+        name="Composite Outcome Workflow",
+        steps=[
+            {
+                "order_index": 0,
+                "step_type": "AI_ANALYSIS",
+                "name": "Risk Analysis",
+                "description": "AI analyzes the operation",
+                "config_json": {"prompt_template": "Analyze this operation"},
+            },
+            {
+                "order_index": 1,
+                "step_type": "HUMAN_APPROVAL",
+                "name": "Supervisor Review",
+                "description": "Supervisor confirms the decision",
+                "config_json": {},
+            },
+        ],
+    )
+
+    def run_and_approve(account: str, op: str, notes: str) -> dict:
+        created = client.post("/api/v1/runs/", headers=headers, json={
+            "workflow_id": workflow_id,
+            "account_id": account,
+            "input_data": {"operation": op},
+        })
+        assert created.status_code == 202, created.text
+        paused = _poll_until_terminal(client, created.json()["id"], headers)
+        assert paused["status"] == RunStatus.PAUSED.value, paused
+        approved = client.post(
+            f"/api/v1/runs/{created.json()['id']}/approve",
+            headers=headers,
+            json={"notes": notes},
+        )
+        assert approved.status_code == 200, approved.text
+        return approved.json()
+
+    first = run_and_approve(
+        f"ACC_A_{uuid4().hex[:6]}", "suspend card", "card suspended for ACC-A"
+    )
+    second = run_and_approve(
+        f"ACC_B_{uuid4().hex[:6]}", "block transaction", "transaction blocked for ACC-B"
+    )
+
+    assert first["status"] == RunStatus.COMPLETED.value
+    assert second["status"] == RunStatus.COMPLETED.value
+
+    out1, out2 = first["output_data"], second["output_data"]
+    assert out1["outcome"] == "APPROVED", out1
+    assert out2["outcome"] == "APPROVED", out2
+    # The operations genuinely reviewed show up in the outcome...
+    assert out1["input"] == {"operation": "suspend card"}, out1
+    assert out2["input"] == {"operation": "block transaction"}, out2
+    # ...and the human verdicts record what actually happened per run.
+    assert out1["human_reviews"]["Supervisor Review"]["notes"] == "card suspended for ACC-A"
+    assert out2["human_reviews"]["Supervisor Review"]["notes"] == "transaction blocked for ACC-B"
+    assert out1["human_reviews"]["Supervisor Review"]["approved"] is True
+    assert out1 != out2
 
 
 def test_failed_run_output_data_is_none(client, mock_llm):

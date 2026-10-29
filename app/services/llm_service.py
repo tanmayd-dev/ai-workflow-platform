@@ -174,6 +174,14 @@ Constraints:
 - MUST include at least one HUMAN_APPROVAL step
 - AI_ANALYSIS steps should specify rag_query for retrieving relevant regulations
 {rule_guidance}
+- If the intent describes an action that should apply once approved (e.g.
+  suspend a card, block a transaction, notify a team), add one final step
+  AFTER the HUMAN_APPROVAL step that records the applied action: an
+  AI_ANALYSIS step whose prompt_template instructs the executor to emit the
+  action record and echo the run input, e.g. prompt_template: "Record the
+  applied action for this decision and echo the account and transaction
+  identifiers from the input data." No action may apply before the human
+  approval step has completed.
 """
         
         user_prompt = f"""User Intent: {intent}
