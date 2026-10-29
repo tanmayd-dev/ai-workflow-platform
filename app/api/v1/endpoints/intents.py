@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.core.rbac import require_roles
 from app.models.user import User
 from app.schemas import IntentRequest, IntentResponse, WorkflowDraft
-from app.services.rag_service import RAGService
+from app.services.rag_service import get_rag_service
 from app.services.llm_service import LLMService
 
 router = APIRouter(tags=["intents"])
@@ -29,7 +29,7 @@ async def draft_from_intent(
     2. Call LLM with intent + context
     3. Return structured workflow definition
     """
-    rag_service = RAGService()
+    rag_service = get_rag_service()
     llm_service = LLMService()
     
     # Retrieve relevant context from knowledge base

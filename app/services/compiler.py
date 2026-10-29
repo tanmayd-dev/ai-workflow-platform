@@ -512,8 +512,8 @@ class WorkflowCompiler:
             domain = workflow.domain if workflow else getattr(step, "domain", "")
             if rag_query and settings.ENABLE_RAG and domain:
                 try:
-                    from app.services.rag_service import RAGService
-                    rag_service = RAGService()
+                    from app.services.rag_service import get_rag_service
+                    rag_service = get_rag_service()
                     retrieved_docs = await rag_service.query_similar(
                         query_text=rag_query,
                         domain=domain,

@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     # Documents Storage
     DOCUMENTS_DIR: str = DEFAULT_DOCUMENTS_DIR
 
+    # Upload hardening: reject files larger than this before anything is
+    # written to disk (HTTP 413). Default 5 MB. Keep grouped with the document
+    # storage settings (DOCUMENT_* naming).
+    DOCUMENT_MAX_BYTES: int = 5 * 1024 * 1024
+
     class Config:
         env_file = ".env"
         case_sensitive = True
