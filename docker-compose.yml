@@ -9,6 +9,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////data/db/workflow_db.sqlite}
       CHROMA_DB_DIR: ${CHROMA_DB_DIR:-/data/chroma}
       DOCUMENTS_DIR: ${DOCUMENTS_DIR:-/data/documents}
+      # RAG is opt-in (default off in containers): enabling it lazily downloads
+      # the embedding model and loads torch at request time, which has been
+      # observed to hard-crash the worker on some CPU-only containers. Set
+      # ENABLE_RAG=true in .env to turn it on.
+      ENABLE_RAG: ${ENABLE_RAG:-false}
       # The entrypoint runs Alembic; do not also create_all() on startup.
       AUTO_CREATE_SCHEMA: "false"
       # First-run seeding: RBAC roles + bootstrap admin + demo rules.

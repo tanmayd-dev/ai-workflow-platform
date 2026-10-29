@@ -134,8 +134,11 @@ class RAGService:
             domain: Domain classification (e.g., 'fraud', 'kyc')
 
         Returns:
-            Number of chunks created
+            Number of chunks created (0 when RAG is disabled — the document
+            row and file are still stored; only embedding is skipped)
         """
+        if not settings.ENABLE_RAG:
+            return 0
         # The embedding + add work is CPU-bound; run it on a worker thread so
         # it cannot block the event loop when called from async endpoints.
         return await asyncio.to_thread(
@@ -189,6 +192,10 @@ class RAGService:
         Returns:
             List of {text, metadata, score} dicts
         """
+        if not settings.ENABLE_RAG:
+            # RAG is opt-in. A disabled deployment must not load the embedding
+            # model — a hard (native) failure there can kill the whole process.
+            return []
         return await asyncio.to_thread(
             self._query_similar_sync, query_text, domain, top_k
         )
@@ -211,6 +218,10 @@ class RAGService:
         """
 
         def _delete() -> int:
+            if not settings.ENABLE_RAG:
+                # RAG disabled: nothing was ever embedded, so there is nothing
+                # to remove from the vector store.
+                return 0
             try:
                 collection = self.client.get_collection(
                     name=f"domain_{domain}"

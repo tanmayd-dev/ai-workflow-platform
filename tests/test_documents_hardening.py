@@ -23,8 +23,16 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.core.config import get_settings
+from app.services import rag_service as rag_service_module
 from app.services.rag_service import RAGService, get_rag_service
 from conftest import grant_role
+
+
+@pytest.fixture(autouse=True)
+def _enable_rag_for_real_pipeline(monkeypatch):
+    """The one real-pipeline test exercises the actual embedding path, so the
+    global ENABLE_RAG=false default (conftest) must be lifted here."""
+    monkeypatch.setattr(rag_service_module.settings, "ENABLE_RAG", True)
 
 
 @pytest.fixture

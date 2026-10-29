@@ -150,6 +150,32 @@ def test_generate_completion_maps_auth_error_to_provider_error(monkeypatch):
     assert "invalid api key" not in str(excinfo.value)  # upstream text never leaks
 
 
+def test_rag_disabled_gates_heavy_paths():
+    """With ENABLE_RAG=false the service must answer fast paths without ever
+    constructing the chroma client or loading the embedding model — a native
+    failure during that load can kill the whole process."""
+    import asyncio as _asyncio
+
+    from app.services.rag_service import RAGService
+
+    import app.services.rag_service as rag_module
+
+    original = rag_module.settings.ENABLE_RAG
+    try:
+        rag_module.settings.ENABLE_RAG = False
+        service = RAGService()
+        assert _asyncio.run(service.query_similar("q", "fraud")) == []
+        assert _asyncio.run(
+            service.ingest_document("text", "id-1", "f.txt", "fraud")
+        ) == 0
+        assert _asyncio.run(service.delete_document("fraud", "id-1")) == 0
+        # The heavy machinery was never touched.
+        assert service._client is None
+        assert service._embeddings is None
+    finally:
+        rag_module.settings.ENABLE_RAG = original
+
+
 def _install_intent_fakes(monkeypatch, content, *, docs, captured):
     """Fake RAG retrieval and the LLM transport for the endpoint under test."""
 

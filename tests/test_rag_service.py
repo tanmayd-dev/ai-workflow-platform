@@ -21,7 +21,15 @@ from app.models.workflow import (
     WorkflowStep,
 )
 from app.services.compiler import WorkflowCompiler, WorkflowState
+from app.services import rag_service as rag_service_module
 from app.services.rag_service import RAGService
+
+
+@pytest.fixture(autouse=True)
+def _enable_rag_for_real_pipeline(monkeypatch):
+    """These tests exercise the real embedding pipeline, so the global
+    ENABLE_RAG=false default (conftest) must be lifted here."""
+    monkeypatch.setattr(rag_service_module.settings, "ENABLE_RAG", True)
 
 
 def _unique_domain(prefix: str = "rag") -> str:
