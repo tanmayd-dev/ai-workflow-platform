@@ -5,6 +5,7 @@ services:
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env}
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
       # Runtime state lives on the named volumes below, not in the image layer.
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////data/db/workflow_db.sqlite}
       CHROMA_DB_DIR: ${CHROMA_DB_DIR:-/data/chroma}

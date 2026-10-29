@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # OpenRouter Configuration
     OPENROUTER_API_KEY: str
-    OPENROUTER_MODEL: str = "openrouter/pony-alpha"
+    OPENROUTER_MODEL: str = "google/gemini-2.5-flash"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
     # Database Configuration
