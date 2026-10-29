@@ -70,6 +70,10 @@ if cors_origins:
 # Include API routers
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+# Admin console UI (single page; one include line — everything self-contained in app/ui)
+from app.ui.router import router as ui_router  # noqa: E402
+app.include_router(ui_router)
+
 
 @app.get("/")
 async def root():

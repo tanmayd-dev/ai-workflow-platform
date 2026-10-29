@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas Ops — Governed Workflow Console</title>
+<link rel="stylesheet" href="/ui/static/app.css">
+</head>
+<body>
+
+<!-- ============ Login gate ============ -->
+<div id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <div class="gate-brand">
+      <span class="wordmark">Atlas&nbsp;Ops</span>
+      <span class="gate-sub">AI-governed workflow orchestration · banking operations</span>
+    </div>
+    <form id="login-form" novalidate>
+      <label for="login-email">Work email</label>
+      <input id="login-email" type="email" autocomplete="username" required placeholder="you@bank.example">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <button id="login-submit" class="btn primary" type="submit">Sign in</button>
+      <div id="login-error" class="form-error" hidden></div>
+      <p class="gate-hint">Accounts are provisioned by the ops team (roles granted via the assign CLI).
+        Ask your administrator if you cannot sign in.</p>
+    </form>
+  </div>
+</div>
+
+<!-- ============ Shell ============ -->
+<div id="shell" hidden>
+  <header class="masthead">
+    <div class="mast-brand">
+      <span class="wordmark">Atlas&nbsp;Ops</span>
+      <span class="mast-sub">governed workflow console</span>
+    </div>
+    <div class="mast-user">
+      <span class="user-email" id="user-email" title="Signed in user">—</span>
+      <button id="signout" class="btn ghost" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Console sections">
+    <button class="rail-btn is-active" data-sec="sec-intents" id="nav-intents" type="button">
+      <span class="rail-num">01</span><span class="rail-label">Intent&thinsp;→&thinsp;Draft</span>
+    </button>
+    <button class="rail-btn" data-sec="sec-workflows" type="button">
+      <span class="rail-num">02</span><span class="rail-label">Workflows</span>
+    </button>
+    <button class="rail-btn" data-sec="sec-runs" type="button">
+      <span class="rail-num">03</span><span class="rail-label">Runs</span>
+    </button>
+    <button class="rail-btn" data-sec="sec-audit" type="button">
+      <span class="rail-num">04</span><span class="rail-label">Audit</span>
+    </button>
+    <div class="rail-foot">maker&ndash;checker enforced at the API</div>
+  </nav>
+
+  <main class="console">
+
+    <!-- ---------- 01 Intent → Draft ---------- -->
+    <section id="sec-intents" class="panel">
+      <h1>Intent <span class="arrow">→</span> Draft</h1>
+      <p class="section-lede">Describe the operation in plain language. The LLM drafts a workflow you review,
+        then file it as a DRAFT for approver review.</p>
+      <div class="intent-grid">
+        <div class="intent-compose">
+          <label for="intent-text">Intent</label>
+          <textarea id="intent-text" rows="6"
+            placeholder="e.g. Suspend a card when the fraud rule scores a transaction above 0.8, and require a supervisor to confirm before the block applies."></textarea>
+          <div class="field-row">
+            <div class="field">
+              <label for="intent-domain">Domain</label>
+              <input id="intent-domain" list="domain-list" placeholder="fraud" spellcheck="false">
+              <datalist id="domain-list">
+                <option value="fraud"></option><option value="kyc"></option>
+                <option value="aml"></option><option value="loan_origination"></option>
+                <option value="disputes"></option>
+              </datalist>
+            </div>
+            <button id="intent-draft-btn" class="btn primary" type="button">Draft workflow</button>
+          </div>
+          <div id="intent-error" class="form-error" hidden></div>
+        </div>
+        <div class="intent-result" id="intent-result" hidden>
+          <div class="draft-head">
+            <label for="intent-name">Proposed name (editable)</label>
+            <input id="intent-name" spellcheck="false">
+            <button id="intent-create-btn" class="btn primary" type="button">Create as DRAFT</button>
+          </div>
+          <div class="mono-block"><pre id="intent-draft-json"></pre></div>
+          <details id="intent-context-wrap" class="context-wrap">
+            <summary>Retrieved RAG context</summary>
+            <pre id="intent-context"></pre>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 02 Workflows ---------- -->
+    <section id="sec-workflows" class="panel" hidden>
+      <div class="section-head">
+        <h1>Workflows</h1>
+        <button id="wf-refresh" class="btn ghost" type="button">Refresh</button>
+      </div>
+      <p class="section-lede">DRAFTs are editable and wait for an approver; APPROVED definitions are immutable
+        and become executable.</p>
+      <table class="grid" id="wf-table">
+        <thead><tr><th>Name</th><th>Domain</th><th>Status</th><th>Created</th><th>Version</th><th>ID</th></tr></thead>
+        <tbody id="wf-list"></tbody>
+      </table>
+      <div id="wf-empty" class="empty-state" hidden>
+        No workflows yet. Start in <strong>01 Intent → Draft</strong>: describe an operation and file the
+        generated definition as a draft.
+      </div>
+    </section>
+
+    <!-- ---------- 03 Runs ---------- -->
+    <section id="sec-runs" class="panel" hidden>
+      <div class="section-head">
+        <h1>Runs</h1>
+        <button id="runs-refresh" class="btn ghost" type="button">Refresh</button>
+      </div>
+      <div class="chips" role="group" aria-label="Filter by status">
+        <button class="chip is-active" data-status="" type="button">ALL</button>
+        <button class="chip" data-status="RUNNING" type="button">RUNNING</button>
+        <button class="chip" data-status="PAUSED" type="button">PAUSED</button>
+        <button class="chip" data-status="COMPLETED" type="button">COMPLETED</button>
+        <button class="chip" data-status="FAILED" type="button">FAILED</button>
+      </div>
+      <div class="run-submit">
+        <form id="run-submit-form" novalidate>
+          <label>Submit a run</label>
+          <div class="run-submit-row">
+            <select id="run-workflow" aria-label="Workflow"></select>
+            <input id="run-account" class="mono" spellcheck="false" placeholder="ACC-000123" aria-label="Account ID">
+            <input id="run-trigger" spellcheck="false" placeholder="Trigger reason (optional)" aria-label="Trigger reason">
+            <button id="run-submit-btn" class="btn primary" type="submit">Submit run</button>
+          </div>
+          <label for="run-input">Input data <span class="mono-inline">JSON</span></label>
+          <textarea id="run-input" class="mono" rows="3" spellcheck="false">{}</textarea>
+          <div id="run-submit-error" class="form-error" hidden></div>
+        </form>
+      </div>
+      <table class="grid" id="runs-table">
+        <thead><tr><th>Status</th><th>Account</th><th>Workflow</th><th>Started</th><th>Run ID</th></tr></thead>
+        <tbody id="runs-list"></tbody>
+      </table>
+      <div id="runs-empty" class="empty-state" hidden>
+        No runs yet — approve a workflow in <strong>02 Workflows</strong>, then submit a run above.
+      </div>
+    </section>
+
+    <!-- ---------- 04 Audit ---------- -->
+    <section id="sec-audit" class="panel" hidden>
+      <div class="section-head">
+        <h1>Audit</h1>
+        <form id="audit-filter-form" class="audit-filter" novalidate>
+          <input id="audit-type" placeholder="entity_type e.g. run" spellcheck="false" aria-label="Entity type">
+          <input id="audit-entity-id" class="mono" placeholder="entity_id (uuid)" spellcheck="false" aria-label="Entity id">
+          <button id="audit-apply" class="btn ghost" type="submit">Apply</button>
+        </form>
+      </div>
+      <table class="grid" id="audit-table">
+        <thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Entity</th></tr></thead>
+        <tbody id="audit-list"></tbody>
+      </table>
+      <div id="audit-empty" class="empty-state" hidden>
+        No audit rows for this filter. The audit trail is visible to <strong>auditor</strong> and
+        <strong>admin</strong> roles; every approval, edit, and run verdict lands here.
+      </div>
+    </section>
+  </main>
+
+  <!-- ---------- Workflow detail drawer ---------- -->
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer-wf" aria-hidden="true">
+    <header class="drawer-head">
+      <h2 id="wf-d-title">Workflow</h2>
+      <button class="drawer-close btn ghost" data-drawer="drawer-wf" type="button" aria-label="Close panel">✕</button>
+    </header>
+    <div class="drawer-body">
+      <div id="wf-d-error" class="form-error" hidden></div>
+      <div class="meta-grid mono" id="wf-d-meta"></div>
+      <div class="drawer-actions" id="wf-d-actions">
+        <button id="wf-d-approve-btn" class="btn primary" type="button">Approve definition</button>
+      </div>
+      <h3>Steps</h3>
+      <ol id="wf-d-steps" class="steps"></ol>
+      <details class="edit-wrap" id="wf-d-edit-wrap">
+        <summary>Edit this DRAFT</summary>
+        <div class="edit-form">
+          <label for="wf-edit-name">Name</label>
+          <input id="wf-edit-name" spellcheck="false">
+          <label for="wf-edit-desc">Description</label>
+          <textarea id="wf-edit-desc" rows="2" spellcheck="false"></textarea>
+          <label for="wf-edit-steps">Steps <span class="mono-inline">JSON</span> <span class="muted">(full replacement)</span></label>
+          <textarea id="wf-edit-steps" class="mono" rows="10" spellcheck="false"></textarea>
+          <div id="wf-edit-validate" class="form-error" hidden></div>
+          <button id="wf-edit-save" class="btn primary" type="button">Save edit</button>
+        </div>
+      </details>
+    </div>
+  </aside>
+
+  <!-- ---------- Run detail drawer ---------- -->
+  <aside class="drawer" id="drawer-run" aria-hidden="true">
+    <header class="drawer-head">
+      <h2 id="run-d-title">Run</h2>
+      <button class="drawer-close btn ghost" data-drawer="drawer-run" type="button" aria-label="Close panel">✕</button>
+    </header>
+    <div class="drawer-body">
+      <div id="run-d-error" class="form-error" hidden></div>
+      <div class="meta-grid mono" id="run-d-meta"></div>
+      <div id="run-d-error-message" class="error-note mono" hidden></div>
+      <h3>Output</h3>
+      <div class="mono-block"><pre id="run-d-output">—</pre></div>
+      <div class="drawer-actions" id="run-d-actions" hidden>
+        <input id="run-d-note" spellcheck="false" placeholder="Reason / notes (optional)">
+        <div class="pair">
+          <button id="run-d-approve" class="btn primary" type="button">Approve</button>
+          <button id="run-d-reject" class="btn danger" type="button">Reject</button>
+        </div>
+      </div>
+      <h3>Executions</h3>
+      <ol id="run-d-executions" class="timeline"></ol>
+    </div>
+  </aside>
+
+  <div id="toasts" aria-live="polite"></div>
+</div>
+
+<script src="/ui/static/app.js"></script>
+</body>
+</html>
