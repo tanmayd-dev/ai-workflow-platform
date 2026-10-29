@@ -146,7 +146,7 @@
         </form>
       </div>
       <table class="grid" id="runs-table">
-        <thead><tr><th>Status</th><th>Account</th><th>Workflow</th><th>Started</th><th>Run ID</th></tr></thead>
+        <thead><tr><th>Status</th><th>Outcome</th><th>Account</th><th>Workflow</th><th>Started</th><th>Run ID</th></tr></thead>
         <tbody id="runs-list"></tbody>
       </table>
       <div id="runs-empty" class="empty-state" hidden>
@@ -216,10 +216,13 @@
       <div id="run-d-error" class="form-error" hidden></div>
       <div class="meta-grid mono" id="run-d-meta"></div>
       <div id="run-d-error-message" class="error-note mono" hidden></div>
+      <div id="run-d-verdict" hidden></div>
       <h3>Input</h3>
       <div class="mono-block"><pre id="run-d-input">—</pre></div>
-      <h3>Output</h3>
-      <div class="mono-block"><pre id="run-d-output">—</pre></div>
+      <details class="snap" id="run-d-payload-wrap">
+        <summary>Output & audit payload (JSON)</summary>
+        <div class="mono-block"><pre id="run-d-output">—</pre></div>
+      </details>
       <div class="drawer-actions" id="run-d-actions" hidden>
         <input id="run-d-note" spellcheck="false" placeholder="Decision notes — recorded in the run output (recommended)">
         <div class="pair">

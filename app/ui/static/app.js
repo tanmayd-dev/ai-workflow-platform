@@ -483,6 +483,7 @@ async function refreshRuns() {
     return `
     <tr data-id="${esc(r.id)}" class="${selectedRunRow === r.id ? "is-open" : ""}">
       <td><span class="pill" data-status="${esc(r.status)}">${esc(r.status)}</span></td>
+      <td>${outcomeCell(r)}</td>
       <td class="cell-id">${esc(r.account_id)}</td>
       <td>${esc(wf ? wf.name : shortId(r.workflow_id))}</td>
       <td class="cell-time">${esc(fmtTime(r.started_at))}</td>
@@ -624,6 +625,81 @@ function execHint(x) {
   return text.length > 140 ? `${text.slice(0, 140)}…` : text;
 }
 
+/* ---- machine-readable decision extraction (runs table + drawer banner) ---- */
+/* Mirrors WorkflowExecutor._decision_verdict: read the compact JSON contract
+   the AI/action steps emit. Falls back to undefined when the payload carries
+   no contract (then the UI shows the raw payload only). */
+function runDecision(run) {
+  const out = run.output_data;
+  if (out && typeof out === "object" && !Array.isArray(out) && out.verdict) return out.verdict;
+  return null;
+}
+
+function verdictTone(verdict, run) {
+  if (!verdict || !verdict.action) return (run && run.status === "PAUSED") ? "amber" : "neutral";
+  const action = String(verdict.action).toUpperCase();
+  if (/SUSPEND|BLOCK|REJECT|CANCEL|DENY|FREEZE|TERMINAT/.test(action)) return "red";
+  if (/ALLOW|APPROVE|CLEAR|NO_ACTION|PROCEED|PASS|RELEASE/.test(action)) return "green";
+  return "amber"; /* REVIEW / unknown → attention */
+}
+
+function verdictChips(verdict, run) {
+  const chips = [];
+  if (verdict.risk_tier) {
+    chips.push(`<span class="vchip" data-tone="${esc(verdictTone(verdict, run))}">risk ${esc(String(verdict.risk_tier).toUpperCase())}${verdict.risk_score !== undefined ? ` · ${esc(String(verdict.risk_score))}` : ""}</span>`);
+  }
+  if (verdict.account) chips.push(`<span class="vchip">account ${esc(verdict.account)}</span>`);
+  if (verdict.transaction_id) chips.push(`<span class="vchip mono">tx ${esc(verdict.transaction_id)}</span>`);
+  return chips.join("");
+}
+
+/* Runs-table outcome cell: big colored action badge, or fallback pill when no
+   decision contract exists yet (mock/legacy runs). */
+function outcomeCell(run) {
+  const verdict = runDecision(run);
+  if (verdict && verdict.action) {
+    const tone = verdictTone(verdict, run);
+    return `<span class="verdict-badge" data-tone="${esc(tone)}">${esc(String(verdict.action).toUpperCase())}</span>`;
+  }
+  return '<span class="muted">—</span>';
+}
+
+/* Drawer banner: half-second glanceability for the decision + its context. */
+function renderVerdictBanner(run) {
+  const box = $("#run-d-verdict");
+  const verdict = runDecision(run);
+  const reviews = (run.output_data && run.output_data.human_reviews) || {};
+  const lastReviewKey = Object.keys(reviews).pop();
+  const review = lastReviewKey ? reviews[lastReviewKey] : null;
+  const tone = verdictTone(verdict, run);
+  const icon = tone === "red" ? "🔴" : tone === "green" ? "🟢" : tone === "amber" ? "🟡" : "⚪";
+
+  let action;
+  if (verdict && verdict.action) action = String(verdict.action).toUpperCase();
+  else if (run.status === "PAUSED") action = "AWAITING SUPERVISOR REVIEW";
+  else {
+    box.hidden = true;
+    return;
+  }
+
+  const chips = verdict ? verdictChips(verdict, run) : "";
+  const reviewer = review ? (review.approver ? ` by ${review.approver}` : "") : "";
+  const note = review && review.notes && review.notes !== "Approved by human reviewer"
+    ? `<div class="v-note">“${esc(review.notes)}”<span class="v-note-by"> — supervisor note${esc(reviewer)}</span></div>`
+    : (review && review.approver ? `<div class="v-note-by">reviewed by ${esc(review.approver)}</div>` : "");
+  const summary = verdict && verdict.summary ? `<div class="v-summary">${esc(verdict.summary)}</div>` : "";
+  const account = run.account_id ? `<span class="vchip">account ${esc(run.account_id)}</span>` : "";
+
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="verdict-banner" data-tone="${esc(tone)}">
+      <div class="verdict-action">${icon} ${esc(action)}</div>
+      ${summary}
+      <div class="v-chips">${account}${chips}</div>
+      ${note}
+    </div>`;
+}
+
 async function refreshRunPanel(keepScroll = false) {
   const id = currentRunId;
   if (!id) return;
@@ -659,6 +735,7 @@ async function refreshRunPanel(keepScroll = false) {
     pretty((run.output_data && typeof run.output_data === "object" && !Array.isArray(run.output_data))
       ? run.output_data.input : undefined);
 
+  renderVerdictBanner(run);
   $("#run-d-output").textContent = pretty(run.output_data);
 
   $("#run-d-actions").hidden = run.status !== "PAUSED";

@@ -182,6 +182,15 @@ Constraints:
   applied action for this decision and echo the account and transaction
   identifiers from the input data." No action may apply before the human
   approval step has completed.
+- EVERY AI_ANALYSIS step's prompt_template MUST demand a compact JSON decision
+  contract with exactly these keys: "action" (short machine-readable label,
+  e.g. "SUSPEND_CARD", "BLOCK_TX", "REVIEW", "NO_ACTION"), "risk_tier"
+  ("LOW"|"MEDIUM"|"HIGH"|"CRITICAL"), "risk_score" (numeric when available),
+  "summary" (max 160 chars), "applied" (true only for post-approval action
+  steps). Example directive to embed in prompt_template: 'Respond ONLY with
+  compact JSON: {{"action": "...", "risk_tier": "...", "risk_score": <number>,
+  "summary": "...", "applied": <bool>}}'. The console renders this verdict as
+  a colored banner; freeform paragraphs cannot be displayed there.
 """
         
         user_prompt = f"""User Intent: {intent}

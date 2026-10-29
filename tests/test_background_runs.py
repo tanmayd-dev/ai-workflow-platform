@@ -540,6 +540,67 @@ def test_two_runs_with_different_reviews_have_different_outputs(client, mock_llm
     assert out1 != out2
 
 
+def test_decision_verdict_extracts_json_contract_from_fenced_content():
+    """The decision banner needs the machine-readable contract even when the
+    model wraps its JSON in markdown fences."""
+    import json as _json
+
+    from app.services.compiler import WorkflowState
+    from app.services.executor import WorkflowExecutor
+
+    contract = {
+        "action": "suspend_card",
+        "risk_tier": "CRITICAL",
+        "risk_score": 0.93,
+        "summary": "score 0.93 exceeded threshold 0.8",
+        "applied": True,
+    }
+    state = WorkflowState(
+        input_data={"transaction_id": "TX-1", "operation": "suspend card"},
+        context={"account_id": "ACC-9"},
+    )
+    state.ai_outputs = {"Apply Action": {"content": "```json\n" + _json.dumps(contract) + "\n```"}}
+    verdict = WorkflowExecutor._decision_verdict(state)
+    assert verdict["action"] == "suspend_card"
+    assert verdict["risk_tier"] == "CRITICAL"
+    assert verdict["applied"] is True
+    assert verdict["account"] == "ACC-9"
+    assert verdict["transaction_id"] == "TX-1"
+
+
+def test_decision_verdict_extracts_json_from_prose():
+    """Models sometimes_embed the JSON in surrounding prose; extraction must
+    still find the first balanced object."""
+    from app.services.compiler import WorkflowState
+    from app.services.executor import WorkflowExecutor
+
+    state = WorkflowState(input_data={"transaction_id": "TX-2"})
+    state.ai_outputs = {
+        "Analyze": {
+            "content": (
+                'Analysis: score above threshold. Decision record: '
+                '{"action": "BLOCK_TX", "risk_tier": "HIGH", "summary": "score over limit"} '
+                '— please review.'
+            )
+        }
+    }
+    verdict = WorkflowExecutor._decision_verdict(state)
+    assert verdict is not None
+    assert verdict["action"] == "BLOCK_TX"
+    assert verdict["risk_tier"] == "HIGH"
+
+
+def test_decision_verdict_none_without_contract():
+    """Mock/legacy runs whose AI output is prose without JSON produce no
+    verdict; the UI then falls back to the raw payload only."""
+    from app.services.compiler import WorkflowState
+    from app.services.executor import WorkflowExecutor
+
+    state = WorkflowState(input_data={"risk_score": 0.4})
+    state.ai_outputs = {"Risk Analysis": {"content": "MOCK-LLM ANALYSIS: transaction risk assessed"}}
+    assert WorkflowExecutor._decision_verdict(state) is None
+
+
 def test_failed_run_output_data_is_none(client, mock_llm):
     """FAILED runs carry no output_data: no final decision output was produced."""
     headers = _register_and_login(client)

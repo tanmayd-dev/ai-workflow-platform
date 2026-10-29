@@ -4,6 +4,7 @@ Executes compiled workflows and manages execution state.
 """
 import asyncio
 import copy
+import json
 import logging
 from uuid import UUID, uuid4
 from datetime import datetime, timedelta
@@ -439,6 +440,77 @@ class WorkflowExecutor:
         )
 
     @staticmethod
+    def _parse_embedded_json(text: Any) -> Optional[Dict[str, Any]]:
+        """Best-effort extraction of a JSON object from an AI step's content.
+
+        Models sometimes wrap JSON in markdown fences or surround it with
+        prose despite instructions; the decision banner still needs the
+        structured ``action``/``risk_tier`` record. Returns the first
+        balanced JSON object found, or None.
+        """
+        if not isinstance(text, str):
+            return None
+        cleaned = text.strip()
+        for fence_variant in ("```json", "```"):
+            if fence_variant in cleaned:
+                cleaned = cleaned.split(fence_variant)[1].split("```")[0].strip()
+                break
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            if start < 0:
+                return None
+            depth = 0
+            for index in range(start, len(cleaned)):
+                if cleaned[index] == "{":
+                    depth += 1
+                elif cleaned[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(cleaned[start:index + 1])
+                        except json.JSONDecodeError:
+                            return None
+                        break
+            else:
+                return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @classmethod
+    def _decision_verdict(cls, state: WorkflowState) -> Optional[Dict[str, Any]]:
+        """Compact machine-readable decision for the run outcome banner.
+
+        Scans the AI step outputs (newest first, so a post-approval action
+        record wins over an earlier analysis) for the JSON decision contract
+        and attaches account context from the run input and context.
+        """
+        decision: Optional[Dict[str, Any]] = None
+        for output in list(state.ai_outputs.values())[::-1]:
+            content = output.get("content") if isinstance(output, dict) else output
+            parsed = cls._parse_embedded_json(content)
+            if parsed and isinstance(parsed.get("action"), str):
+                decision = parsed
+                break
+        if not decision:
+            return None
+        verdict = {
+            key: decision[key]
+            for key in ("action", "risk_tier", "risk_score", "summary", "applied")
+            if key in decision
+        }
+        account = (
+            state.input_data.get("account_id")
+            or (state.context.get("account_id"))
+        )
+        if account and "account" not in verdict:
+            verdict["account"] = account
+        transaction = state.input_data.get("transaction_id")
+        if transaction:
+            verdict["transaction_id"] = transaction
+        return verdict
+
+    @staticmethod
     def _compose_run_output(state: WorkflowState, outcome: str) -> Dict[str, Any]:
         """Composite run outcome replacing the raw last-node output.
 
@@ -453,6 +525,9 @@ class WorkflowExecutor:
             "outcome": outcome,
             "last_step_output": state.current_output,
         }
+        verdict = WorkflowExecutor._decision_verdict(state)
+        if verdict:
+            composite["verdict"] = verdict
         if state.input_data:
             composite["input"] = state.input_data
         if state.ai_outputs:

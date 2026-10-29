@@ -530,7 +530,19 @@ class WorkflowCompiler:
             
             # Call LLM with proper async and parameters
             result = await self.llm_service.generate_completion(
-                system_prompt="You are an AI assistant for fraud detection and compliance analysis. Provide structured, professional analysis.",
+                system_prompt=(
+                    "You are an AI assistant for fraud detection and compliance "
+                    "analysis. Provide structured, professional analysis. "
+                    "Respond with a COMPACT JSON object (no markdown fences, no "
+                    "prose around it) using exactly these keys:\n"
+                    '- "action": short machine-readable label of the decision '
+                    '(e.g. "SUSPEND_CARD", "BLOCK_TX", "REVIEW", "NO_ACTION")\n'
+                    '- "risk_tier": "LOW", "MEDIUM", "HIGH" or "CRITICAL"\n'
+                    '- "risk_score": the numeric score this step evaluated (when input provides one)\n'
+                    '- "summary": the decision reason in at most 160 characters\n'
+                    '- "applied": true only when this step APPLIES an action after '
+                    'human approval, otherwise false'
+                ),
                 user_prompt=user_prompt,
                 context=context_text if context_text else None
             )
