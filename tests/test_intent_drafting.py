@@ -176,6 +176,57 @@ def test_rag_disabled_gates_heavy_paths():
         rag_module.settings.ENABLE_RAG = original
 
 
+def test_intent_draft_system_prompt_lists_available_rules(client, monkeypatch):
+    """DOMAIN_RULE references must come from the real rule library: the draft
+    prompt enumerates the domain's active rule names and forbids inventing ids
+    (a hallucinated rule_id hard-fails approval validation)."""
+    captured: dict = {}
+    _install_intent_fakes(monkeypatch, json.dumps(VALID_DRAFT), docs=[], captured=captured)
+    headers = _author_headers(client)
+
+    rule_name = f"fraud_score_{uuid4().hex[:6]}"
+    created = client.post(
+        "/api/v1/rules",
+        headers=headers,
+        json={
+            "name": rule_name,
+            "domain": "fraud",
+            "logic_json": {"field": "risk_score", "operator": ">", "value": 0.8},
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.post(
+        "/api/v1/intents/draft",
+        headers=headers,
+        json={"intent": INTENT, "domain": "fraud"},
+    )
+    assert response.status_code == 200, response.text
+
+    system_prompt = captured["llm"]["system_prompt"]
+    assert "RULE LIBRARY" in system_prompt
+    assert f'"{rule_name}"' in system_prompt
+    assert "Never invent, abbreviate, or modify a rule name" in system_prompt
+
+
+def test_intent_draft_system_prompt_warns_when_domain_has_no_rules(client, monkeypatch):
+    """An empty rule library for the domain must be stated explicitly, so the
+    model cannot reference rules that do not exist."""
+    captured: dict = {}
+    _install_intent_fakes(monkeypatch, json.dumps(VALID_DRAFT), docs=[], captured=captured)
+    headers = _author_headers(client)
+
+    response = client.post(
+        "/api/v1/intents/draft",
+        headers=headers,
+        json={"intent": INTENT, "domain": "kyc"},  # no kyc rules seeded
+    )
+    assert response.status_code == 200, response.text
+
+    system_prompt = captured["llm"]["system_prompt"]
+    assert "No rules exist in the rule library for this domain" in system_prompt
+
+
 def _install_intent_fakes(monkeypatch, content, *, docs, captured):
     """Fake RAG retrieval and the LLM transport for the endpoint under test."""
 

@@ -115,19 +115,37 @@ class LLMService:
         self,
         intent: str,
         domain: str,
-        retrieved_context: str
+        retrieved_context: str,
+        available_rules: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a workflow definition from natural language intent.
-        
+
         Args:
             intent: User's natural language intent
             domain: Domain (fraud, kyc, etc.)
             retrieved_context: Relevant regulatory/policy documents
-            
+            available_rules: Exact rule names with an active version in the
+                rule library for this domain. Referencing anything else fails
+                approval validation, so the model must be told what exists.
+
         Returns:
             Structured workflow definition as dict
         """
+        if available_rules is None:
+            rule_guidance = "The rule library has not been queried — do not invent rule names; prefer AI_ANALYSIS or HUMAN_APPROVAL steps over DOMAIN_RULE."
+        elif available_rules:
+            names = ", ".join(f'"{name}"' for name in available_rules)
+            rule_guidance = (
+                "RULE LIBRARY (these are the ONLY rule names that exist for this domain):\n"
+                f"[{names}]\n"
+                "A DOMAIN_RULE step's config_json.rule_id MUST be one of these exact names. "
+                "Never invent, abbreviate, or modify a rule name. If none of them matches "
+                "the intent, do not use a DOMAIN_RULE step — express the check via an "
+                "AI_ANALYSIS step or fold it into the HUMAN_APPROVAL step's description."
+            )
+        else:
+            rule_guidance = "No rules exist in the rule library for this domain. Do not use DOMAIN_RULE steps — express the check via an AI_ANALYSIS step or fold it into the HUMAN_APPROVAL step's description."
         system_prompt = f"""You are an expert workflow designer for regulated banking operations.
 Your task is to design a workflow definition based on user intent and regulatory context.
 
@@ -155,7 +173,7 @@ Output a JSON object with the following structure:
 Constraints:
 - MUST include at least one HUMAN_APPROVAL step
 - AI_ANALYSIS steps should specify rag_query for retrieving relevant regulations
-- DOMAIN_RULE steps should reference specific rule names
+{rule_guidance}
 """
         
         user_prompt = f"""User Intent: {intent}

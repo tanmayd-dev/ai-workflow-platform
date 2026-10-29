@@ -1,10 +1,12 @@
 """Intent-based workflow drafting endpoint."""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.rbac import require_roles
+from app.models.rule import Rule, RuleVersion
 from app.models.user import User
 from app.schemas import IntentRequest, IntentResponse, WorkflowDraft
 from app.services.rag_service import get_rag_service
@@ -44,13 +46,26 @@ async def draft_from_intent(
         f"[Doc: {doc['metadata'].get('filename', 'Unknown')}]\n{doc['text']}"
         for doc in similar_docs
     ])
-    
+
+    # The model must reference real rules, not hallucinated ones: give it the
+    # exact rule names that carry an active version in this domain. Any other
+    # name hard-fails approval validation (Rule.name match), so this list is
+    # the source of truth for DOMAIN_RULE references.
+    rules_result = await db.execute(
+        select(Rule.name)
+        .join(RuleVersion, RuleVersion.rule_id == Rule.id)
+        .where(Rule.domain == request.domain, RuleVersion.is_active == True)  # noqa: E712
+        .distinct()
+    )
+    available_rules = sorted(name for (name,) in rules_result.all())
+
     # Generate workflow draft
     try:
         llm_result = await llm_service.draft_workflow(
             intent=request.intent,
             domain=request.domain,
-            retrieved_context=context_text
+            retrieved_context=context_text,
+            available_rules=available_rules,
         )
     except LLMProviderError as exc:
         # Provider failures (bad key, quota, network) are client-actionable
