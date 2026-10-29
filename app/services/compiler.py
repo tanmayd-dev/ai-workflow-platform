@@ -368,6 +368,23 @@ class WorkflowCompiler:
                 f"Conditional step '{step.name}' requires a non-empty "
                 f"config_json.condition object"
             )
+        # Validate the condition shape now, at approval, instead of letting a
+        # malformed one fail the run hours later (seen live: a drafting model
+        # emitted "operator" and "risk_score", blowing up at execution).
+        if not any(key in condition for key in ("all", "any", "not")):
+            missing = [
+                name for name, present in (
+                    ("field", condition.get("field")),
+                    ("op/operator", condition.get("op") or condition.get("operator")),
+                    ("value", condition.get("value")),
+                ) if not present and present != 0
+            ]
+            if missing:
+                raise ValueError(
+                    f"Conditional step '{step.name}' condition {condition} is "
+                    f"missing required key(s): {', '.join(missing)}; expected e.g. "
+                    f'{{"field": "fraud_score", "op": ">", "value": 0.8}}'
+                )
 
         resolved: Dict[str, Any] = {
             "condition": condition,

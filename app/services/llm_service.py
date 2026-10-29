@@ -165,7 +165,7 @@ Output a JSON object with the following structure:
         "rag_query": "optional query for context retrieval",
         "rule_id": "optional rule reference",
         "prompt_template": "template for AI nodes",
-        "condition": "CONDITIONAL only: JSON-DSL condition object, e.g. {{\"field\": \"fraud_score\", \"operator\": \">\", \"value\": 0.8}}",
+        "condition": "CONDITIONAL only: JSON-DSL condition object, e.g. {{\"field\": \"fraud_score\", \"op\": \">\", \"value\": 0.8}} — the operator key is \"op\" (not \"operator\")",
         "on_true": "CONDITIONAL only: name of the step to run when the condition is met",
         "on_false": "CONDITIONAL only: name of the step to run when the condition is NOT met"
       }}
@@ -187,13 +187,18 @@ Constraints:
   terminal AI step that records NO_ACTION. Example for "suspend a card only
   when fraud_score is above 0.8, with supervisor confirmation":
     0 EvaluateFraudScore (AI_ANALYSIS, prompt_template demands the JSON contract)
-    1 CheckThreshold (CONDITIONAL, condition {{"field": "fraud_score", "operator": ">", "value": 0.8}},
+    1 CheckThreshold (CONDITIONAL, condition {{"field": "fraud_score", "op": ">", "value": 0.8}},
       on_true "SupervisorApproval", on_false "RecordNoAction")
     2 SupervisorApproval (HUMAN_APPROVAL)
     3 SuspendCard (AI_ANALYSIS ...)
     4 RecordNoAction (AI_ANALYSIS, prompt_template: "Record that no action was required for this low-risk operation. Respond ONLY with compact JSON: ...applied\": false")
   The condition evaluates against the run input plus earlier step outputs,
-  so a rule or AI step earlier in the chain supplies the score field.
+  so a rule or AI step earlier in the chain supplies the score field. The
+  condition's "field" MUST be a field the run input actually carries (use the
+  exact field name from the intent/user data, e.g. "fraud_score"); do NOT use
+  the decision contract's "risk_score" JSON key as a condition field, and do
+  not invent field names — a condition on a field the input lacks misroutes
+  the run.
 - If the intent describes an action that should apply once approved (e.g.
   suspend a card, block a transaction, notify a team), place that action step
   in the TRUE branch after the HUMAN_APPROVAL step (see the branch layout

@@ -20,6 +20,35 @@ from app.services.compiler import WorkflowCompiler
 from app.services.executor import WorkflowExecutor
 
 
+def test_rule_engine_accepts_operator_alias():
+    """Drafting models naturally emit "operator" where the canonical DSL key
+    is "op" (seen live: a drafted gate {'field': 'risk_score', 'operator': '>',
+    'value': 0.8} crashed the run with 'Invalid condition'). Both keys evaluate."""
+    from app.services.rule_engine import RuleEngine
+
+    engine = RuleEngine()
+    context = {"fraud_score": 0.93}
+    canonical = {"field": "fraud_score", "op": ">", "value": 0.8}
+    alias = {"field": "fraud_score", "operator": ">", "value": 0.8}
+    assert engine._evaluate_condition(canonical, context) is True
+    assert engine._evaluate_condition(alias, context) is True
+
+    low = {"fraud_score": 0.2}
+    assert engine._evaluate_condition(alias, low) is False
+    assert engine._evaluate_condition(canonical, low) is False
+
+
+def test_rule_engine_missing_operand_error_is_actionable():
+    from app.services.rule_engine import RuleEngine
+
+    engine = RuleEngine()
+    with pytest.raises(ValueError) as excinfo:
+        engine._evaluate_condition({"field": "fraud_score", "value": 0.8}, {"fraud_score": 0.9})
+    message = str(excinfo.value)
+    assert '"op" or "operator"' in message
+    assert "field" in message
+
+
 @pytest_asyncio.fixture
 async def db_session():
     async_session_maker = get_session_maker()

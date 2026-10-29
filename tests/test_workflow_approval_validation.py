@@ -105,6 +105,44 @@ def _get_workflow(client: TestClient, headers: dict, workflow_id: str) -> dict:
     return response.json()
 
 
+def test_approving_malformed_condition_fails_gate_not_run(client):
+    """A CONDITIONAL step whose condition object lacks field/op/value (seen
+    live: a drafting model emitted "operator"/"risk_score" variants) must be
+    rejected at approval validation with an actionable message — not crash
+    the run at execution time."""
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
+    workflow = _create_workflow(client, headers, [
+        {
+            "order_index": 0,
+            "step_type": "CONDITIONAL",
+            "name": "CheckThreshold",
+            "description": "Branch on the fraud score",
+            "config_json": {
+                # Missing "value" entirely; also exercises the "op"-free shape.
+                "condition": {"field": "fraud_score", "operator": ">"},
+                "on_true": "ApprovalGate",
+            },
+        },
+        {
+            "order_index": 1,
+            "step_type": "HUMAN_APPROVAL",
+            "name": "ApprovalGate",
+            "description": "Human review",
+            "config_json": {},
+        },
+    ])
+
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
+    assert approved.status_code == 422, approved.text
+    detail = approved.json()["detail"]
+    assert "Workflow does not pass approval validation" in detail
+    assert "missing required key" in detail
+
+    fetched = _get_workflow(client, headers, workflow["id"])
+    assert fetched["status"] == "DRAFT"
+
+
 def test_approving_zero_step_workflow_returns_422_and_stays_draft(client):
     """A zero-step definition can be approved today and fails on execution;
     the gate must now refuse it and leave it in DRAFT."""

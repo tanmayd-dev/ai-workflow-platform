@@ -64,13 +64,18 @@ class RuleEngine:
             # NOT logic
             return not self._evaluate_condition(condition["not"], context)
         
-        # Handle simple comparison
+        # Handle simple comparison. Tolerate the natural "operator" key; the
+        # canonical DSL key is "op" (drafting models frequently emit "operator").
         field = condition.get("field")
-        op_str = condition.get("op")
+        op_str = condition.get("op") or condition.get("operator")
         value = condition.get("value")
-        
+
         if not field or not op_str:
-            raise ValueError(f"Invalid condition: {condition}")
+            raise ValueError(
+                f"Invalid condition: {condition} — a simple condition object "
+                f'needs a "field" and an operator ("op" or "operator"), e.g. '
+                f'{{"field": "fraud_score", "op": ">", "value": 0.8}}'
+            )
         
         # Get field value from context
         context_value = context.get(field)
