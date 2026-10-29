@@ -3,10 +3,19 @@ LLM Service - Interface to OpenRouter
 Handles AI interactions with audit logging.
 """
 from typing import Dict, Any, Optional, List
+import openai
 from openai import AsyncOpenAI
 from app.core.config import get_settings
 
 settings = get_settings()
+
+
+class LLMProviderError(RuntimeError):
+    """The upstream LLM provider call failed (auth, model, quota, network).
+
+    Derived messages are safe to show to users: they name the failure mode
+    but never include the caller's key or upstream internals.
+    """
 
 
 class LLMService:
@@ -52,13 +61,39 @@ class LLMService:
         
         messages.append({"role": "user", "content": user_prompt})
         
-        # Call OpenRouter
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+        # Call OpenRouter; map provider failures to LLMProviderError so callers
+        # (and their HTTP surfaces) can answer with a clear message instead of
+        # an opaque 500. Only exception *types* are mapped — the user-facing
+        # message never embeds the raw upstream error.
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        except openai.AuthenticationError as exc:
+            raise LLMProviderError(
+                "the LLM provider rejected the API key (401 Unauthorized); "
+                "check OPENROUTER_API_KEY"
+            ) from exc
+        except openai.NotFoundError as exc:
+            raise LLMProviderError(
+                f"the LLM provider does not offer model '{self.model}'; "
+                "check OPENROUTER_MODEL"
+            ) from exc
+        except openai.RateLimitError as exc:
+            raise LLMProviderError(
+                "the LLM provider rate limit or quota was hit; try again shortly"
+            ) from exc
+        except openai.APIConnectionError as exc:
+            raise LLMProviderError(
+                "could not reach the LLM provider (network error or timeout)"
+            ) from exc
+        except openai.APIStatusError as exc:
+            raise LLMProviderError(
+                f"the LLM provider returned an error (HTTP {exc.status_code})"
+            ) from exc
         
         # Extract completion
         content = response.choices[0].message.content

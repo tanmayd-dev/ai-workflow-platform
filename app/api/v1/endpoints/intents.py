@@ -8,7 +8,7 @@ from app.core.rbac import require_roles
 from app.models.user import User
 from app.schemas import IntentRequest, IntentResponse, WorkflowDraft
 from app.services.rag_service import get_rag_service
-from app.services.llm_service import LLMService
+from app.services.llm_service import LLMProviderError, LLMService
 
 router = APIRouter(tags=["intents"])
 
@@ -46,11 +46,17 @@ async def draft_from_intent(
     ])
     
     # Generate workflow draft
-    llm_result = await llm_service.draft_workflow(
-        intent=request.intent,
-        domain=request.domain,
-        retrieved_context=context_text
-    )
+    try:
+        llm_result = await llm_service.draft_workflow(
+            intent=request.intent,
+            domain=request.domain,
+            retrieved_context=context_text
+        )
+    except LLMProviderError as exc:
+        # Provider failures (bad key, quota, network) are client-actionable
+        # configuration problems, not server crashes: answer 502 with the
+        # readable reason so the console can display it.
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
     
     # Parse JSON from LLM response
     import json

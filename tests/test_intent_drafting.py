@@ -8,9 +8,11 @@ The endpoint currently validates the LLM output for JSON *syntax* (with a
 markdown-fence fallback) but not against the workflow schema; the strict
 xfail at the bottom records that gap (see issue #15 report).
 """
+import asyncio
 import json
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -78,6 +80,74 @@ def _author_headers(client: TestClient) -> dict:
     })
     assert login.status_code == 200, login.text
     return {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+
+@pytest.mark.asyncio
+async def test_provider_rejection_is_mapped_not_a_500(client, monkeypatch):
+    """An upstream provider failure (e.g. a bad OPENROUTER_API_KEY producing
+    401, or quota/network errors) must surface as a clear 502 — never a raw
+    500 — so the console can tell the user what to fix."""
+    from app.services.llm_service import LLMProviderError
+
+    async def fake_query_similar(self, query_text, domain, top_k=3):
+        return []
+
+    async def raising_generate_completion(self, *args, **kwargs):
+        # generate_completion itself maps AuthenticationError to
+        # LLMProviderError; simulate the post-mapping state at the service
+        # boundary the endpoint actually sees.
+        raise LLMProviderError(
+            "the LLM provider rejected the API key (401 Unauthorized); "
+            "check OPENROUTER_API_KEY"
+        )
+
+    monkeypatch.setattr(
+        "app.services.rag_service.RAGService.query_similar", fake_query_similar
+    )
+    monkeypatch.setattr(
+        "app.services.llm_service.LLMService.generate_completion",
+        raising_generate_completion,
+    )
+
+    response = client.post(
+        "/api/v1/intents/draft",
+        headers=_author_headers(client),
+        json={"intent": INTENT, "domain": DOMAIN},
+    )
+    assert response.status_code == 502, response.text
+    assert "OPENROUTER_API_KEY" in response.json()["detail"]
+
+
+def test_generate_completion_maps_auth_error_to_provider_error(monkeypatch):
+    """The OpenAI SDK's 401 AuthenticationError must be translated into
+    LLMProviderError (message mentions OPENROUTER_API_KEY, raw error hidden)."""
+    import asyncio
+    import openai
+
+    from app.services.llm_service import LLMProviderError
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            # openai's 401 error: httpx.Response + message
+            request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            response = httpx.Response(401, request=request)
+            raise openai.AuthenticationError(
+                "invalid api key", response=response, body=None
+            )
+
+    class FakeClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {})()
+            self.chat.completions = FakeCompletions()
+
+    service = LLMService()
+    service.client = FakeClient()
+
+    with pytest.raises(LLMProviderError) as excinfo:
+        asyncio.run(service.generate_completion("system", "user"))
+
+    assert "OPENROUTER_API_KEY" in str(excinfo.value)
+    assert "invalid api key" not in str(excinfo.value)  # upstream text never leaks
 
 
 def _install_intent_fakes(monkeypatch, content, *, docs, captured):
