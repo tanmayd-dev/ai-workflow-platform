@@ -142,6 +142,8 @@ async function doLogin(evt) {
 }
 
 $("#signout").addEventListener("click", onUnauthorized);
+/* The login form must preventDefault (native submit would just reload /ui) */
+$("#login-form").addEventListener("submit", doLogin);
 
 /* ---------------- boot / shell ---------------- */
 async function boot() {
