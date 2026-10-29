@@ -26,6 +26,16 @@ jobs:
       - name: Install dependencies
         run: uv pip install -r requirements.txt -r requirements-dev.txt
 
+      # The RAG tests load the real sentence-transformers model. Cache it so CI
+      # does not re-download ~90MB from Hugging Face on every run.
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('app/core/config.py') }}
+          restore-keys: |
+            hf-${{ runner.os }}-
+
       - name: Run test suite
         run: .venv/bin/python -m pytest -q
 
@@ -53,4 +63,51 @@ jobs:
       - name: Run lint
         # Minimal correctness gate (undefined names, syntax errors) — legacy
         # style noise (format/ordering rules) is deferred to a cleanup pass.
-        run: .venv/bin/ruff check --select E9,F821 app/ tests/
+        # scripts/ is included: demo, e2e_check and check_migrations are real
+        # code, not throwaways. ruff is pinned (requirements-dev.txt).
+        run: .venv/bin/ruff check --select E9,F821 app/ tests/ scripts/
+
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install dependencies
+        run: uv pip install -r requirements.txt -r requirements-dev.txt
+
+      # exercise the full cycle: upgrade head -> downgrade base -> upgrade head
+      # against a fresh scratch sqlite database (deleted when the script ends).
+      - name: Run migration cycle
+        run: PYTHON=.venv/bin/python scripts/check_migrations.sh
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Compose validation only: required vars (${:?}) are satisfied with dummies.
+      - name: Validate compose file
+        run: |
+          export OPENROUTER_API_KEY=ci-smoke-dummy
+          export SECRET_KEY=ci-smoke-dummy
+          export POSTGRES_PASSWORD=ci-smoke-dummy
+          docker compose config -q
+
+      # Build only — no push, no secrets needed.
+      - name: Build image
+        run: docker build -t app:ci .
