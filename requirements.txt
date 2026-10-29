@@ -17,6 +17,9 @@ langchain-community==0.3.5
 langchain-openai==0.2.9
 langgraph==0.2.45
 openai==1.54.5
+# Pin: openai 1.54.5 passes `proxies=` to httpx.AsyncClient, which was removed
+# in httpx 0.28; an unpinned transitive httpx breaks AsyncOpenAI at runtime.
+httpx==0.27.2
 
 # Vector Store & Embeddings
 chromadb==0.5.20
