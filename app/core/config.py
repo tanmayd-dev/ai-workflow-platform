@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 
@@ -101,6 +102,16 @@ class Settings(BaseSettings):
         # Ignore unrelated keys (e.g. container-only APP_UID/APP_GID) instead
         # of failing to start when .env is shared with docker-compose.
         extra = "ignore"
+
+    @model_validator(mode="after")
+    def _validate_secret_key_strength(self) -> "Settings":
+        """Refuse to boot with a guessable signing key for JWTs."""
+        if len(self.SECRET_KEY) < 32:
+            raise ValueError(
+                "SECRET_KEY must be at least 32 characters long; generate one "
+                "with `python -c \"import secrets; print(secrets.token_hex(32))\"`"
+            )
+        return self
 
 
 @lru_cache()

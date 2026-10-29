@@ -29,7 +29,7 @@ shutil.rmtree(TEST_CHROMA_DIR, ignore_errors=True)
 shutil.rmtree(TEST_DOCS_DIR, ignore_errors=True)
 
 os.environ["OPENROUTER_API_KEY"] = "test-openrouter-key"
-os.environ["SECRET_KEY"] = "test-secret-key-for-jwt-signing"
+os.environ["SECRET_KEY"] = "test-secret-key-for-jwt-signing-0123456789abcdef"
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
 os.environ["CHROMA_DB_DIR"] = str(TEST_CHROMA_DIR)
 os.environ["DOCUMENTS_DIR"] = str(TEST_DOCS_DIR)

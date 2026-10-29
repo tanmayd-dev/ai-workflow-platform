@@ -158,7 +158,7 @@ def main() -> int:
     os.environ["CHROMA_DB_DIR"] = str(tmp / "chroma")
     os.environ["DOCUMENTS_DIR"] = str(tmp / "documents")
     os.environ.setdefault("OPENROUTER_API_KEY", "e2e-offline-key-not-used")
-    os.environ.setdefault("SECRET_KEY", "e2e-offline-secret-key-for-jwt")
+    os.environ.setdefault("SECRET_KEY", "e2e-offline-secret-key-for-jwt-signing-0123456789abcdef")
     os.environ.setdefault("ENABLE_RAG", "false")
     os.environ.setdefault("AUTO_CREATE_SCHEMA", "true")
 

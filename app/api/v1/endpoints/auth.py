@@ -3,13 +3,24 @@ Authentication endpoints for user management.
 """
 from datetime import timedelta
 from typing import Annotated
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
-from app.core.security import verify_password, get_password_hash, create_access_token, decode_access_token
+from app.core.rate_limit import (
+    check_rate_limit,
+    record_failed_attempt,
+    reset_rate_limit,
+)
+from app.core.security import (
+    verify_password,
+    get_password_hash,
+    upgrade_legacy_hash,
+    create_access_token,
+    decode_access_token,
+)
 from app.core.config import get_settings
 from app.models.user import User
 from app.schemas import UserCreate, UserResponse, Token
@@ -34,18 +45,26 @@ async def get_current_user(
     payload = decode_access_token(token)
     if payload is None:
         raise credentials_exception
-    
+
     email: str = payload.get("sub")
     if email is None:
         raise credentials_exception
-    
+
     # Get user from database
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
-    
+
     if user is None:
         raise credentials_exception
-    
+
+    # The token is bound to the user it was issued for: a token whose
+    # user_id claim points at a different user must not authenticate
+    # against another account with the same email claim (e.g. after an
+    # email was taken over and re-registered).
+    token_user_id = payload.get("user_id")
+    if token_user_id is None or token_user_id != str(user.id):
+        raise credentials_exception
+
     return user
 
 
@@ -94,26 +113,50 @@ async def register(
 @router.post("/login", response_model=Token)
 async def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """Login and receive JWT access token."""
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Failed-login sliding window per (IP, email); blocked attempts are
+    # rejected before any password check happens.
+    retry_after = check_rate_limit(client_ip, form_data.username)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts; try again later",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     # Get user by email
     result = await db.execute(select(User).where(User.email == form_data.username))
     user = result.scalar_one_or_none()
-    
+
     if not user or not verify_password(form_data.password, user.hashed_password):
+        record_failed_attempt(client_ip, form_data.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Inactive user"
         )
-    
+
+    # Upgrade-on-login: legacy SHA-256 hashes are transparently rehashed
+    # with Argon2id after a successful verification.
+    legacy_rehash = upgrade_legacy_hash(form_data.password, user.hashed_password)
+    if legacy_rehash is not None:
+        user.hashed_password = legacy_rehash
+        db.add(user)
+        await db.commit()
+
+    reset_rate_limit(client_ip, form_data.username)
+
     # Create access token
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
