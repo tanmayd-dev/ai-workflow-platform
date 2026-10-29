@@ -137,16 +137,35 @@ class WorkflowExecutor:
     def __init__(self):
         self.compiler = WorkflowCompiler()
 
-    async def _resolve_rule_logics(
-        self, db: AsyncSession, workflow: WorkflowDefinition
-    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, UUID]]:
-        """Load the active latest rule version for every rule_id a step references.
+    RULE_VERSIONS_PINNED_MISSING = (
+        "Pinned rule version {rule} v{version} no longer exists in the rule "
+        "library; refusing to silently substitute a newer version"
+    )
 
-        Returns the logic keyed by rule_id plus the resolved RuleVersion IDs, so
-        NodeExecution rows can record exactly which version was evaluated.
+    async def _resolve_rule_logics(
+        self,
+        db: AsyncSession,
+        workflow: WorkflowDefinition,
+        pinned: Optional[Dict[str, int]] = None,
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, UUID], Dict[str, int]]:
+        """Load the rule version for every rule_id a step references.
+
+        With ``pinned`` (a {rule_name: version_number} mapping recorded on the
+        run at execution start), those exact versions are resolved instead of
+        the latest-active ones — resume and replay must re-execute against the
+        rule logic the original leg saw, immune to later version bumps. Rules
+        missing from the mapping (legacy runs started before pinning) fall
+        back to latest-active. A pinned version row that has been deleted is a
+        hard error: refusing to silently substitute a newer version preserves
+        the audit analogy between legs.
+
+        Returns the logic keyed by rule_id, the resolved RuleVersion IDs, and
+        the resolved version numbers (the run's pin record) so NodeExecution
+        rows can record exactly which version was evaluated.
         """
         rule_logics: Dict[str, Dict[str, Any]] = {}
         rule_version_ids: Dict[str, UUID] = {}
+        rule_version_numbers: Dict[str, int] = {}
         for step in sorted(workflow.steps, key=lambda s: s.order_index):
             rule_id = (step.config_json or {}).get("rule_id")
             if not rule_id or rule_id in rule_logics:
@@ -159,18 +178,46 @@ class WorkflowExecutor:
                     f"Rule '{rule_id}' referenced by step '{step.name}' not found in the rule library"
                 )
 
-            version_result = await db.execute(
-                select(RuleVersion)
-                .where(RuleVersion.rule_id == rule.id, RuleVersion.is_active == True)  # noqa: E712
-                .order_by(RuleVersion.version_number.desc())
-            )
-            version = version_result.scalars().first()
-            if not version:
-                raise ValueError(f"Rule '{rule_id}' exists but has no active version")
+            version: Optional[RuleVersion] = None
+            pinned_number = (pinned or {}).get(rule_id)
+            if pinned_number is not None:
+                # Pinning deliberately ignores is_active: the version the run
+                # started with must be reused even if a newer version became
+                # active (or this one was deactivated) in the meantime.
+                version_result = await db.execute(
+                    select(RuleVersion).where(
+                        RuleVersion.rule_id == rule.id,
+                        RuleVersion.version_number == pinned_number,
+                    )
+                )
+                version = version_result.scalars().first()
+                if not version:
+                    raise ValueError(
+                        self.RULE_VERSIONS_PINNED_MISSING.format(
+                            rule=rule_id, version=pinned_number
+                        )
+                    )
+            else:
+                if pinned is not None:
+                    logger.warning(
+                        "Rule '%s' is not in the run's pinned rule versions; "
+                        "resolving the latest active version as a legacy-run "
+                        "fallback",
+                        rule_id,
+                    )
+                version_result = await db.execute(
+                    select(RuleVersion)
+                    .where(RuleVersion.rule_id == rule.id, RuleVersion.is_active == True)  # noqa: E712
+                    .order_by(RuleVersion.version_number.desc())
+                )
+                version = version_result.scalars().first()
+                if not version:
+                    raise ValueError(f"Rule '{rule_id}' exists but has no active version")
 
             rule_logics[rule_id] = version.logic_json
             rule_version_ids[rule_id] = version.id
-        return rule_logics, rule_version_ids
+            rule_version_numbers[rule_id] = version.version_number
+        return rule_logics, rule_version_ids, rule_version_numbers
 
     async def _audit(
         self,
@@ -413,7 +460,8 @@ class WorkflowExecutor:
         db: AsyncSession,
         run_id: UUID = None,
         triggered_by: UUID = None,
-        human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None
+        human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None,
+        pinned_rule_versions: Optional[Dict[str, int]] = None,
     ) -> WorkflowRun:
         """
         Execute a workflow and persist all results.
@@ -428,6 +476,10 @@ class WorkflowExecutor:
                 (falls back to the workflow's creator)
             human_verdicts: Optional pre-supplied verdicts for human approval steps
                 (used during deterministic replay)
+            pinned_rule_versions: Optional {rule_name: version_number} mapping
+                forcing those exact rule versions (replay reuses the original
+                run's pins). None resolves the latest active versions and pins
+                them on the run.
 
         Returns:
             WorkflowRun with execution results
@@ -463,18 +515,30 @@ class WorkflowExecutor:
             run = result.scalar_one()
         run.input_data = input_data  # Persist inputs so `replay()` can re-execute
         run_pk = run.id  # Plain-Python PK snapshot, safe to use after any session state change
-        await self._audit_run(db, run, "started", details={"account_id": account_id})
-        # Durability checkpoint: the run row, its inputs, and the "started"
-        # audit commit before execution so a crash mid-execution still leaves a
-        # discoverable RUNNING row (reaped by the startup lease sweep) instead
-        # of vanishing entirely.
-        await db.commit()
 
         try:
             # Resolve rule logic from the rule library, then compile to a graph.
             # Inside the try: resolution/compile failures must mark the run FAILED
-            # like every other execution failure.
-            rule_logics, rule_version_ids = await self._resolve_rule_logics(db, workflow)
+            # like every other execution failure. The resolved version numbers
+            # are pinned onto the run BEFORE execution (durably committed with
+            # the started audit) so a resume/replay leg re-resolves exactly
+            # those versions instead of whatever became latest-active later.
+            rule_logics, rule_version_ids, rule_versions = await self._resolve_rule_logics(
+                db, workflow, pinned=pinned_rule_versions
+            )
+            run.rule_versions_pinned = rule_versions
+            await self._audit_run(
+                db,
+                run,
+                "started",
+                details={"account_id": account_id, "rule_versions": rule_versions},
+            )
+            # Durability checkpoint: the run row, its inputs, the rule-version
+            # pins, and the "started" audit commit before execution so a crash
+            # mid-execution still leaves a discoverable RUNNING row (reaped by
+            # the startup lease sweep) instead of vanishing entirely.
+            await db.commit()
+
             graph = self.compiler.compile(workflow, rule_logics, human_verdicts=human_verdicts)
 
             # Initialize state
@@ -713,7 +777,10 @@ class WorkflowExecutor:
                 actor_id=actor_id,
                 actor_role=actor_role,
             )
-            rule_logics, rule_version_ids = await self._resolve_rule_logics(db, workflow)
+            rule_logics, rule_version_ids, rule_versions = await self._resolve_rule_logics(
+                db, workflow, pinned=run.rule_versions_pinned
+            )
+            run.rule_versions_pinned = rule_versions
             human_verdicts = {paused_step.name: verdict}
             graph = self.compiler.compile(
                 workflow,
@@ -1031,14 +1098,17 @@ class WorkflowExecutor:
                     if step:
                         human_verdicts[step.name] = ne.output_snapshot
 
-        # Execute with same input and recorded human verdicts
+        # Execute with same input and recorded human verdicts, reusing the
+        # original run's pinned rule versions: the replay must re-evaluate the
+        # exact rule logic the original leg saw, not any newer active version.
         replay_run = await self.execute(
             workflow_id=original_run.workflow_id,
             input_data=original_run.input_data,
             account_id=original_run.account_id,
             db=db,
             triggered_by=triggered_by,
-            human_verdicts=human_verdicts
+            human_verdicts=human_verdicts,
+            pinned_rule_versions=original_run.rule_versions_pinned,
         )
         
         # Mark as replay

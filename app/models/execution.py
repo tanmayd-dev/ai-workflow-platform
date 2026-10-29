@@ -73,6 +73,11 @@ class WorkflowRun(Base):
     # run instead of creating a duplicate decision (unique partial index).
     idempotency_key = Column(String(200), nullable=True)
 
+    # Rule-version pinning: {rule_name: version_number} recorded at execution
+    # start; resume/replay re-resolve exactly these versions (not the latest
+    # active ones) so later version bumps cannot alter a past or resumed leg.
+    rule_versions_pinned = Column(JSON, nullable=True)
+
     # Audit
     triggered_by = Column(UUID(as_uuid=True), nullable=False)
     trigger_reason = Column(Text, nullable=True)

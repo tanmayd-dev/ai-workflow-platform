@@ -203,6 +203,9 @@ class RunResponse(BaseModel):
     # may be a dict (AI output, approval verdict) or a scalar (rule result).
     # Validate as any JSON, not dict-only.
     output_data: Optional[Any] = None
+    # {rule_name: version_number} resolved at execution start; resume/replay
+    # re-resolve exactly these versions instead of the latest-active ones.
+    rule_versions_pinned: Optional[Dict[str, int]] = None
 
     class Config:
         from_attributes = True

@@ -9,7 +9,7 @@ from typing import List, Optional
 from uuid import uuid4, UUID
 
 from app.core.database import get_db
-from app.core.rbac import require_roles
+from app.core.rbac import ADMIN_ROLE, require_roles
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.models.user import User
 from app.models.execution import AuditLog
@@ -24,6 +24,22 @@ from app.services.workflow_validator import validate_workflow_for_approval
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _is_admin(user: User) -> bool:
+    """True when an already-role-populated user holds the ``admin`` superuser role.
+
+    Mirrors ``runs._has_admin_role``: ``require_roles`` preloads
+    ``user_roles`` → ``role`` synchronously, so the maker-checker check below
+    needs no extra session access. Kept local to this module for the same
+    reason that helper stays in runs.py (this is a separate change area).
+    """
+    if user is None:
+        return False
+    return any(
+        (link.role is not None and link.role.name or "").strip().lower() == ADMIN_ROLE
+        for link in (user.user_roles or [])
+    )
 
 
 @router.post("/draft", response_model=WorkflowResponse, status_code=201)
@@ -133,6 +149,9 @@ async def approve_workflow(
     - Changes status to APPROVED
     - Workflow becomes immutable
     - Sets approved_by and approved_at
+
+    Raises 409 when the approving user is the workflow's creator (maker-checker;
+    admin superusers exempt).
     """
     result = await db.execute(
         select(WorkflowDefinition)
@@ -148,6 +167,18 @@ async def approve_workflow(
         raise HTTPException(status_code=400, detail="Only DRAFT workflows can be approved")
     
     user_id = current_user.id
+
+    # Maker-checker (separation of duties): the workflow's author is the
+    # "maker" and must not approve their own draft — a second approver signs
+    # off. The admin superuser role is exempt.
+    if user_id == workflow.created_by and not _is_admin(current_user):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"User {user_id} cannot approve workflow {workflow.id}: they are its "
+                f"creator; maker-checker requires a second, different user (admin superusers exempt)"
+            ),
+        )
     
     # Validate BEFORE flipping the status: a broken definition (no steps,
     # duplicate order_index/names, unresolvable rule references, bad branch

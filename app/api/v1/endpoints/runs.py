@@ -83,6 +83,36 @@ async def _is_admin(db: AsyncSession, user: Optional[User]) -> bool:
     return _has_admin_role(await _load_user_with_roles(db, user))
 
 
+async def _deny_maker_checker(
+    db: AsyncSession,
+    user: Optional[User],
+    maker_id: UUID,
+    *,
+    action: str,
+    entity_label: str,
+    entity_id: UUID,
+) -> None:
+    """409 when the acting user made the artefact they are trying to judge.
+
+    Maker-checker (separation of duties): the user who triggered a run (or
+    created a workflow) is the "maker"; approving/rejecting it is the
+    "checker" and must be a second person. The ``admin`` superuser role is
+    exempt: it already confers every role and exists for break-glass
+    administration.
+    """
+    if user is None or user.id != maker_id:
+        return
+    if await _is_admin(db, user):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"User {user.id} cannot {action} {entity_label} {entity_id}: they are "
+            f"its maker; maker-checker requires a second, different user (admin superusers exempt)"
+        ),
+    )
+
+
 def _replay_response(response: Response, existing_run: WorkflowRun) -> WorkflowRun:
     """Mark a 200 replay of an idempotent request on the response object."""
     response.status_code = 200
@@ -406,6 +436,7 @@ async def approve_run(
     Constraints:
     - Run must exist (404)
     - Run must be in PAUSED status (400)
+    - Run triggerer cannot approve their own run (409); admin superusers exempt
     """
     result = await db.execute(
         select(WorkflowRun).where(WorkflowRun.id == run_id)
@@ -420,6 +451,15 @@ async def approve_run(
             status_code=400,
             detail=f"Run {run_id} is not in PAUSED status (current: {run.status})"
         )
+
+    await _deny_maker_checker(
+        db,
+        current_user,
+        run.triggered_by,
+        action="approve",
+        entity_label="run",
+        entity_id=run_id,
+    )
 
     notes = approval_data.notes if approval_data and approval_data.notes else "Approved by human reviewer"
     approver = getattr(current_user, "email", str(current_user.id))
@@ -473,6 +513,7 @@ async def reject_run(
     Constraints:
     - Run must exist (404)
     - Run must be in PAUSED status (400)
+    - Run triggerer cannot reject their own run (409); admin superusers exempt
     """
     result = await db.execute(
         select(WorkflowRun).where(WorkflowRun.id == run_id)
@@ -487,6 +528,15 @@ async def reject_run(
             status_code=400,
             detail=f"Run {run_id} is not in PAUSED status (current: {run.status})"
         )
+
+    await _deny_maker_checker(
+        db,
+        current_user,
+        run.triggered_by,
+        action="reject",
+        entity_label="run",
+        entity_id=run_id,
+    )
 
     reason = reject_data.get_reason() if reject_data else "Rejected by user"
 

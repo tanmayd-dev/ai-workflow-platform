@@ -46,6 +46,12 @@ def _register_with_roles(client: TestClient, roles: list) -> dict:
     return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
+def _approver_headers(client: TestClient) -> dict:
+    """A second user with the approver role — maker-checker forbids creators
+    approving their own workflow, so validation tests approve via proxy."""
+    return _register_with_roles(client, ["approver"])
+
+
 def _create_workflow(client: TestClient, headers: dict, steps: list):
     body = {
         "name": f"Validation Workflow {uuid4().hex[:8]}",
@@ -102,10 +108,11 @@ def _get_workflow(client: TestClient, headers: dict, workflow_id: str) -> dict:
 def test_approving_zero_step_workflow_returns_422_and_stays_draft(client):
     """A zero-step definition can be approved today and fails on execution;
     the gate must now refuse it and leave it in DRAFT."""
-    headers = _register_with_roles(client, ["author", "approver"])
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
     workflow = _create_workflow(client, headers, [])
 
-    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=headers)
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
     assert approved.status_code == 422, approved.text
     assert "Workflow does not pass approval validation" in approved.json()["detail"]
 
@@ -118,13 +125,14 @@ def test_approving_zero_step_workflow_returns_422_and_stays_draft(client):
 def test_approving_workflow_with_nonexistent_rule_returns_422_detail_mentions_rule(client):
     """config_json.rule_id is matched against Rule.name at execution time; a
     reference that resolves to nothing must fail the gate now."""
-    headers = _register_with_roles(client, ["author", "approver"])
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
     missing_rule = f"missing_rule_{uuid4().hex[:8]}"
     workflow = _create_workflow(
         client, headers, [_rule_step(missing_rule), _approval_step()]
     )
 
-    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=headers)
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
     assert approved.status_code == 422, approved.text
     assert missing_rule in approved.json()["detail"]
     assert "rule" in approved.json()["detail"]
@@ -135,13 +143,14 @@ def test_approving_workflow_with_nonexistent_rule_returns_422_detail_mentions_ru
 
 def test_approving_valid_rule_and_approval_workflow_still_200(client, mock_llm):
     """A well-formed workflow (real rule reference + human gate) approves as before."""
-    headers = _register_with_roles(client, ["author", "approver"])
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
     rule_name = _create_rule(client, headers)
     workflow = _create_workflow(
         client, headers, [_rule_step(rule_name), _approval_step()]
     )
 
-    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=headers)
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
     assert approved.status_code == 200, approved.text
     assert approved.json()["status"] == "APPROVED"
 
@@ -149,7 +158,8 @@ def test_approving_valid_rule_and_approval_workflow_still_200(client, mock_llm):
 def test_patch_editable_while_draft_then_approve_service_sees_edited_steps(client, mock_llm):
     """PATCH replaces steps while DRAFT; the approve endpoint then validates and
     approves the *edited* definition, and GET exposes the replacement steps."""
-    headers = _register_with_roles(client, ["author", "approver"])
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
     workflow = _create_workflow(
         client, headers, [{
             "order_index": 0,
@@ -178,7 +188,7 @@ def test_patch_editable_while_draft_then_approve_service_sees_edited_steps(clien
     assert [step["name"] for step in fetched_before["steps"]] == patched_names
 
     # The approve gate sees the edited (rule + approval) steps.
-    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=headers)
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
     assert approved.status_code == 200, approved.text
 
     fetched_after = _get_workflow(client, headers, workflow["id"])
@@ -188,7 +198,8 @@ def test_patch_editable_while_draft_then_approve_service_sees_edited_steps(clien
 
 def test_patch_after_approval_returns_409(client):
     """Editing is a DRAFT-only affordance: an APPROVED workflow cannot be edited."""
-    headers = _register_with_roles(client, ["author", "approver"])
+    headers = _register_with_roles(client, ["author"])
+    approver = _approver_headers(client)
     workflow = _create_workflow(
         client, headers, [{
             "order_index": 0,
@@ -198,7 +209,7 @@ def test_patch_after_approval_returns_409(client):
             "config_json": {},
         }]
     )
-    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=headers)
+    approved = client.post(f"/api/v1/workflows/{workflow['id']}/approve", headers=approver)
     assert approved.status_code == 200, approved.text
 
     patched = client.patch(
