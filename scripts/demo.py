@@ -186,7 +186,18 @@ def ensure_approver_user() -> tuple[str, dict]:
     output = (assign_role.stdout + assign_role.stderr).strip()
     print(f"  assign_role.py: {output}")
     if assign_role.returncode != 0:
-        raise SystemExit("✗ Could not grant the approver role; is .env configured?")
+        # assign_role.py writes to the app's database directly, so it only
+        # works when that database is reachable from this shell (local dev
+        # with a configured .env). Against a container the state lives in the
+        # container's volume — grant the role from inside it instead.
+        raise SystemExit(
+            "✗ Could not grant the approver role from the host.\n"
+            "  assign_role.py needs the app's .env and a locally reachable DB.\n"
+            "  If the server runs in a container, grant the role inside it, e.g.:\n"
+            "    podman exec <app_container> python scripts/assign_role.py \\\n"
+            f"        --email {APPROVER_EMAIL} --role approver\n"
+            "  (docker exec works the same way), then re-run this demo."
+        )
 
     return login(APPROVER_EMAIL, APPROVER_PASSWORD)
 

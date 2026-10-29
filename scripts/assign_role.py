@@ -20,15 +20,34 @@ from uuid import uuid4
 # Add repository root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import func, select
-from app.core.database import get_session_maker
-from app.models.user import Role, User, UserRole
-
 ROLE_NAMES = ("admin", "author", "approver", "executor", "auditor")
+
+
+def _settings_error_hint(exc: Exception) -> str:
+    """Explain how to give assign_role.py the app configuration it needs.
+
+    This script writes to the app's database directly, so it needs the same
+    settings the app boots with (a configured .env or exported env vars).
+    """
+    return (
+        f"✗ Could not load app settings: {type(exc).__name__}\n"
+        "  assign_role.py writes to the app's database directly and needs the\n"
+        "  app's configuration: either copy .env.example to .env and fill it in,\n"
+        "  or export the required vars (see the error above; typically\n"
+        "  SECRET_KEY and OPENROUTER_API_KEY). If the server runs in a\n"
+        "  container, grant the role inside it instead:\n"
+        "    podman exec <app_container> python scripts/assign_role.py \\\n"
+        "        --email <user@example.com> --role <role>\n"
+    )
 
 
 async def assign_role(email: str, role_name: str, remove: bool = False) -> int:
     """Return a process exit code: 0 on success/no-op, 1 when the user is unknown."""
+    from sqlalchemy import func, select
+
+    from app.core.database import get_session_maker
+    from app.models.user import Role, User, UserRole
+
     normalized = role_name.strip().lower()
 
     session_maker = get_session_maker()
@@ -101,7 +120,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    return asyncio.run(assign_role(args.email, args.role, args.remove))
+    try:
+        return asyncio.run(assign_role(args.email, args.role, args.remove))
+    except Exception as exc:  # lazy imports raise app-settings errors here
+        print(_settings_error_hint(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
