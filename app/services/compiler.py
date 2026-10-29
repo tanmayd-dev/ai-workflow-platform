@@ -79,7 +79,8 @@ class WorkflowCompiler:
         workflow: WorkflowDefinition,
         rule_logics: Optional[Dict[str, Dict[str, Any]]] = None,
         start_step_index: int = 0,
-        human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None
+        human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None,
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> StateGraph:
         """
         Convert a WorkflowDefinition to an executable LangGraph.
@@ -93,6 +94,16 @@ class WorkflowCompiler:
                 (used when resuming from a paused step).
             human_verdicts: Pre-supplied verdicts keyed by step name for
                 human approval steps.
+            recorded_outputs: Optional {step_name: {status, output, input, ...}}
+                map of the ORIGINAL run's recorded node outputs (built by the
+                executor). When given, the graph runs in recorded-replay mode:
+                AI nodes return their recorded output verbatim (no LLM call),
+                DOMAIN_RULE nodes reuse the recorded result (no re-evaluation,
+                the pinned rule version is still recorded on the node row), and
+                CONDITIONAL nodes route exactly along the recorded gate
+                outcome. Human approval nodes are unaffected (verdicts were
+                already reused via ``human_verdicts``). Costs determinism:
+                the replay leg is bit-identical to the original execution.
 
         Returns:
             StateGraph ready for execution
@@ -257,7 +268,12 @@ class WorkflowCompiler:
             node_name = node_names[step.name]
 
             if step.step_type == StepType.AI_ANALYSIS:
-                graph.add_node(node_name, self._guard_node(step, self._create_ai_node(step, workflow)))
+                graph.add_node(
+                    node_name,
+                    self._guard_node(
+                        step, self._create_ai_node(step, workflow, recorded_outputs)
+                    ),
+                )
             elif step.step_type == StepType.DOMAIN_RULE:
                 rule_id = (step.config_json or {}).get("rule_id")
                 if rule_id and rule_id not in rule_logics:
@@ -267,7 +283,12 @@ class WorkflowCompiler:
                     )
                 graph.add_node(
                     node_name,
-                    self._guard_node(step, self._create_rule_node(step, rule_logics.get(rule_id))),
+                    self._guard_node(
+                        step,
+                        self._create_rule_node(
+                            step, rule_logics.get(rule_id), recorded_outputs
+                        ),
+                    ),
                 )
             elif step.step_type == StepType.HUMAN_APPROVAL:
                 verdict = human_verdicts.get(step.name)
@@ -282,7 +303,10 @@ class WorkflowCompiler:
                     self._guard_node(
                         step,
                         self._create_conditional_node(
-                            step, on_true=spec["on_true"], on_false=spec["on_false"]
+                            step,
+                            on_true=spec["on_true"],
+                            on_false=spec["on_false"],
+                            recorded_outputs=recorded_outputs,
                         ),
                     ),
                 )
@@ -431,10 +455,52 @@ class WorkflowCompiler:
                 raise
         return sync_wrapper
     
-    def _create_ai_node(self, step, workflow: Optional[WorkflowDefinition] = None):
-        """Create an AI analysis node."""
+    def _create_ai_node(
+        self,
+        step,
+        workflow: Optional[WorkflowDefinition] = None,
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
+        """Create an AI analysis node.
+
+        With ``recorded_outputs`` the node is a recorded-replay stub: it
+        replays the original leg's recorded output verbatim and never calls
+        the LLM. A visited step without a recorded entry fails loudly —
+        recorded mode is deterministic-only, it must not silently fall back
+        to a fresh (nondeterministic) LLM call.
+        """
         async def ai_node(state: WorkflowState) -> WorkflowState:
             """Execute AI analysis with (best-effort) RAG context."""
+            if recorded_outputs is not None:
+                recorded = recorded_outputs.get(step.name)
+                if recorded is None:
+                    raise ValueError(
+                        f"Recorded replay: AI step '{step.name}' has no recorded "
+                        f"node output from the original run; recorded mode "
+                        f"never re-calls the LLM"
+                    )
+                output = recorded.get("output")
+                prompt_snapshot = (
+                    output.get("prompt_snapshot")
+                    if isinstance(output, dict)
+                    else None
+                )
+                content = output.get("content") if isinstance(output, dict) else output
+                context_text = recorded.get("retrieved_context") or ""
+
+                state.ai_outputs[step.name] = output
+                state.ai_prompts[step.name] = prompt_snapshot
+                # Mark the replay leg: the model did not run again here.
+                state.ai_models[step.name] = "recorded-replay"
+                state.retrieved_contexts[step.name] = context_text
+                state.current_output = {"content": content}
+                state.context["last_ai_output"] = content
+                state.context["retrieved_context"] = context_text
+                state.context["last_prompt"] = prompt_snapshot
+                if step.name not in state.executed_steps:
+                    state.executed_steps.append(step.name)
+                return state
+
             config = step.config_json
             rag_query = config.get("rag_query", "")
             prompt_template = config.get("prompt_template", "")
@@ -485,10 +551,39 @@ class WorkflowCompiler:
         
         return ai_node
     
-    def _create_rule_node(self, step, rule_logic: Optional[Dict[str, Any]]):
-        """Create a rule evaluation node (logic resolved from the rule library)."""
+    def _create_rule_node(
+        self,
+        step,
+        rule_logic: Optional[Dict[str, Any]],
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
+        """Create a rule evaluation node (logic resolved from the rule library).
+
+        With ``recorded_outputs`` the node reuses the original leg's recorded
+        result instead of re-evaluating (deterministic replay). The executor
+        still records the pinned rule_version_id on the node row.
+        """
         def rule_node(state: WorkflowState) -> WorkflowState:
             """Execute deterministic rule evaluation."""
+            if recorded_outputs is not None:
+                recorded = recorded_outputs.get(step.name)
+                if recorded is None:
+                    raise ValueError(
+                        f"Recorded replay: rule step '{step.name}' has no "
+                        f"recorded node output from the original run; "
+                        f"recorded mode never re-evaluates rules"
+                    )
+                result = recorded.get("output")
+                rule_id = (step.config_json or {}).get("rule_id")
+                state.rule_outputs[step.name] = result
+                state.current_output = result
+                state.context["last_rule_result"] = result
+                state.context["last_rule_id"] = rule_id
+                state.context["last_rule_step"] = step.name
+                if step.name not in state.executed_steps:
+                    state.executed_steps.append(step.name)
+                return state
+
             # No rule reference declared: pass-through, record absence explicitly
             if rule_logic is None:
                 result = None
@@ -549,16 +644,44 @@ class WorkflowCompiler:
         step,
         on_true: Optional[str] = None,
         on_false: Optional[str] = None,
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         """Create a conditional branching node.
 
         The condition uses the same JSON DSL as rules and is evaluated against
         the run input plus the outputs produced by earlier steps. The chosen
         target is a step *name* (``None`` means fall through linearly).
+
+        With ``recorded_outputs`` the gate replays the recorded routing
+        outcome (``{"condition_met": ..., "next": ...}`` from the original
+        leg's gate output) instead of re-evaluating the condition, so a
+        re-executed AI output that drifted cannot flip the branch.
         """
         def conditional_node(state: WorkflowState) -> WorkflowState:
             config = step.config_json or {}
             condition = config.get("condition")
+
+            if recorded_outputs is not None:
+                recorded = recorded_outputs.get(step.name)
+                if recorded is None:
+                    raise ValueError(
+                        f"Recorded replay: conditional step '{step.name}' has "
+                        f"no recorded gate output from the original run; "
+                        f"recorded mode cannot re-derive routing"
+                    )
+                gate = recorded.get("output")
+                if not isinstance(gate, dict) or "next" not in gate:
+                    raise ValueError(
+                        f"Recorded replay: conditional step '{step.name}' has "
+                        f"no recorded routing outcome (its gate output was "
+                        f"never completed in the original run)"
+                    )
+                state.conditional_outputs[step.name] = dict(gate)
+                state.context["condition_result"] = gate.get("condition_met")
+                state.current_output = {"condition_met": gate.get("condition_met")}
+                if step.name not in state.executed_steps:
+                    state.executed_steps.append(step.name)
+                return state
 
             eval_data = {
                 **state.input_data,

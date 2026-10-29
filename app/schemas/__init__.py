@@ -1,7 +1,7 @@
 """Pydantic schemas for API request/response validation."""
 from pydantic import BaseModel, EmailStr, Field, model_validator
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from uuid import UUID
 from app.models.workflow import WorkflowStatus, StepType
 from app.models.execution import RunStatus, NodeStatus
@@ -190,6 +190,19 @@ class RunRejectRequest(BaseModel):
         return self.reason or self.rejection_reason or "Rejected by user"
 
 
+class ReplayRequest(BaseModel):
+    """Optional body for POST /runs/{id}/replay.
+
+    ``re-execute`` (default) re-runs every node — AI nodes call the LLM
+    again and rules re-evaluate against the pinned rule versions.
+    ``recorded`` replays the original run's recorded node outputs verbatim:
+    no LLM calls, no rule re-evaluation, conditional routing follows the
+    recorded gate outcomes (deterministic; COMPLETED source runs only).
+    """
+
+    mode: Literal["recorded", "re-execute"] = "re-execute"
+
+
 class RunResponse(BaseModel):
     id: UUID
     workflow_id: UUID
@@ -206,6 +219,8 @@ class RunResponse(BaseModel):
     # {rule_name: version_number} resolved at execution start; resume/replay
     # re-resolve exactly these versions instead of the latest-active ones.
     rule_versions_pinned: Optional[Dict[str, int]] = None
+    # Set when this run is a replay of another (linkage, audit trail).
+    replayed_from_run_id: Optional[UUID] = None
 
     class Config:
         from_attributes = True

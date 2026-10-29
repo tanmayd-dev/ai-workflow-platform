@@ -3,6 +3,7 @@ Workflow Executor Service
 Executes compiled workflows and manages execution state.
 """
 import asyncio
+import copy
 import logging
 from uuid import UUID, uuid4
 from datetime import datetime, timedelta
@@ -29,6 +30,16 @@ logger = logging.getLogger(__name__)
 # run before executing (CAS on a NULL/expired lease) and must re-extend the
 # lease more often than this TTL while the run is alive.
 LEASE_TTL_SECONDS = 300
+
+
+class ReplayValidationError(ValueError):
+    """A replay request cannot be satisfied deterministically.
+
+    Raised for recorded-mode replays against a non-COMPLETED source run, or
+    when the source run's recorded node outputs are incomplete (tampered or
+    wiped). The API layer surfaces this as HTTP 409 so the client gets a
+    definite "cannot replay this way" instead of a 500.
+    """
 
 
 async def try_claim_run_lease(
@@ -462,6 +473,8 @@ class WorkflowExecutor:
         triggered_by: UUID = None,
         human_verdicts: Optional[Dict[str, Dict[str, Any]]] = None,
         pinned_rule_versions: Optional[Dict[str, int]] = None,
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None,
+        replay_mode: Optional[str] = None,
     ) -> WorkflowRun:
         """
         Execute a workflow and persist all results.
@@ -480,6 +493,15 @@ class WorkflowExecutor:
                 forcing those exact rule versions (replay reuses the original
                 run's pins). None resolves the latest active versions and pins
                 them on the run.
+            recorded_outputs: Optional {step_name: {status, output, input, ...}}
+                map of the ORIGINAL run's recorded node outputs. When given
+                (recorded-mode replay), the compiled graph replays those
+                outputs verbatim: no LLM calls, no rule re-evaluation,
+                conditional routing follows the original run's recorded gate
+                outcomes.
+            replay_mode: Optional marker ("recorded") recorded in the run's
+                "started" audit details so a replay leg is identifiable in the
+                audit trail.
 
         Returns:
             WorkflowRun with execution results
@@ -526,12 +548,15 @@ class WorkflowExecutor:
             rule_logics, rule_version_ids, rule_versions = await self._resolve_rule_logics(
                 db, workflow, pinned=pinned_rule_versions
             )
+            started_details = {"account_id": account_id, "rule_versions": rule_versions}
+            if replay_mode:
+                started_details["replay_mode"] = replay_mode
             run.rule_versions_pinned = rule_versions
             await self._audit_run(
                 db,
                 run,
                 "started",
-                details={"account_id": account_id, "rule_versions": rule_versions},
+                details=started_details,
             )
             # Durability checkpoint: the run row, its inputs, the rule-version
             # pins, and the "started" audit commit before execution so a crash
@@ -539,7 +564,12 @@ class WorkflowExecutor:
             # the startup lease sweep) instead of vanishing entirely.
             await db.commit()
 
-            graph = self.compiler.compile(workflow, rule_logics, human_verdicts=human_verdicts)
+            graph = self.compiler.compile(
+                workflow,
+                rule_logics,
+                human_verdicts=human_verdicts,
+                recorded_outputs=recorded_outputs,
+            )
 
             # Initialize state
             initial_state = WorkflowState(
@@ -1055,11 +1085,88 @@ class WorkflowExecutor:
                     await db.commit()
             raise
 
+    async def _build_recorded_outputs(
+        self,
+        db: AsyncSession,
+        original_run: WorkflowRun,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Build {step_name: {status, output, input, ...}} from a source run.
+
+        Recorded-mode replay's raw material: every executed (COMPLETED)
+        AI / DOMAIN_RULE / CONDITIONAL node of the original run contributes
+        its output snapshot. HUMAN_APPROVAL nodes are excluded — their
+        verdicts are replayed via ``human_verdicts`` — and SKIPPED nodes are
+        excluded too: the replayed graph follows the same conditional routing
+        as the original, so it never visits them either.
+
+        Raises ReplayValidationError when any node the graph will visit has
+        no recorded output (its node-execution row was deleted or tampered):
+        replaying such a leg would silently fall back to live, potentially
+        differing re-execution.
+        """
+        result = await db.execute(
+            select(WorkflowDefinition)
+            .where(WorkflowDefinition.id == original_run.workflow_id)
+            .options(selectinload(WorkflowDefinition.steps))
+        )
+        workflow = result.scalar_one_or_none()
+        if not workflow:
+            raise ReplayValidationError(
+                f"Workflow {original_run.workflow_id} of run {original_run.id} not found"
+            )
+
+        steps_by_type = {
+            step.name: step
+            for step in workflow.steps
+            if step.step_type
+            in (StepType.AI_ANALYSIS, StepType.DOMAIN_RULE, StepType.CONDITIONAL)
+        }
+
+        # Executed steps according to the original run's own state snapshot.
+        snapshot = original_run.state_snapshot or {}
+        executed_names = set(snapshot.get("executed_steps") or [])
+
+        # Recorded outputs: the latest COMPLETED node execution per step id.
+        completed_by_step: Dict[UUID, NodeExecution] = {}
+        for ne in original_run.node_executions or []:
+            if ne.status == NodeStatus.COMPLETED and ne.output_snapshot is not None:
+                existing = completed_by_step.get(ne.step_id)
+                if existing is None or (ne.completed_at or ne.started_at) >= (
+                    existing.completed_at or existing.started_at
+                ):
+                    completed_by_step[ne.step_id] = ne
+
+        missing: list[str] = []
+        recorded_outputs: Dict[str, Dict[str, Any]] = {}
+        for name in sorted(executed_names):
+            step = steps_by_type.get(name)
+            if step is None:
+                continue  # approval / non-recordable step: handled via human_verdicts
+            recorded = completed_by_step.get(step.id)
+            if recorded is None:
+                missing.append(name)
+                continue
+            recorded_outputs[name] = {
+                "status": "COMPLETED",
+                "output": copy.deepcopy(recorded.output_snapshot),
+                "input": copy.deepcopy(recorded.input_snapshot),
+                "retrieved_context": copy.deepcopy(recorded.retrieved_context),
+            }
+
+        if missing:
+            raise ReplayValidationError(
+                "Recorded replay requires the original run's recorded node "
+                "output for every executed node; missing for: "
+                f"{', '.join(sorted(missing))}"
+            )
+        return recorded_outputs
+
     async def replay(
         self,
         original_run_id: UUID,
         db: AsyncSession,
-        triggered_by: UUID = None
+        triggered_by: UUID = None,
+        mode: str = "re-execute",
     ) -> WorkflowRun:
         """
         Replay a previous workflow execution for verification.
@@ -1068,6 +1175,13 @@ class WorkflowExecutor:
             original_run_id: ID of the run to replay
             db: Database session
             triggered_by: Optional authenticated user initiating the replay
+            mode: "re-execute" (default) re-runs every node — AI nodes call
+                the LLM again and rules re-evaluate. "recorded" is the
+                deterministic mode: the original run's recorded node outputs
+                are replayed verbatim (no LLM call, no rule re-evaluation,
+                routing follows the recorded gate outcomes); only usable for
+                COMPLETED source runs with an intact node-execution trail
+                (otherwise ReplayValidationError → HTTP 409).
 
         Returns:
             New WorkflowRun with replay results
@@ -1083,7 +1197,11 @@ class WorkflowExecutor:
         if not original_run:
             raise ValueError(f"Run {original_run_id} not found")
 
-        # Collect human approval verdicts from original run
+        if mode not in ("recorded", "re-execute"):
+            raise ReplayValidationError(
+                f"Unknown replay mode: {mode} (use 'recorded' or 're-execute')"
+            )
+
         human_verdicts = {}
         if original_run.state_snapshot and isinstance(original_run.state_snapshot, dict):
             human_verdicts = dict(original_run.state_snapshot.get("human_approvals", {}))
@@ -1098,9 +1216,20 @@ class WorkflowExecutor:
                     if step:
                         human_verdicts[step.name] = ne.output_snapshot
 
-        # Execute with same input and recorded human verdicts, reusing the
-        # original run's pinned rule versions: the replay must re-evaluate the
-        # exact rule logic the original leg saw, not any newer active version.
+        recorded_outputs: Optional[Dict[str, Dict[str, Any]]] = None
+        replay_mode: Optional[str] = None
+        if mode == "recorded":
+            if original_run.status != RunStatus.COMPLETED:
+                raise ReplayValidationError(
+                    "Recorded replay requires a COMPLETED source run "
+                    f"(current: {original_run.status})"
+                )
+            recorded_outputs = await self._build_recorded_outputs(db, original_run)
+            replay_mode = "recorded"
+
+        # Re-execute mode: reuse the original run's pinned rule versions so
+        # the replay re-evaluates the exact rule logic the original leg saw.
+        # Recorded mode additionally replays the outputs without executing.
         replay_run = await self.execute(
             workflow_id=original_run.workflow_id,
             input_data=original_run.input_data,
@@ -1109,10 +1238,12 @@ class WorkflowExecutor:
             triggered_by=triggered_by,
             human_verdicts=human_verdicts,
             pinned_rule_versions=original_run.rule_versions_pinned,
+            recorded_outputs=recorded_outputs,
+            replay_mode=replay_mode,
         )
-        
+
         # Mark as replay
         replay_run.replayed_from_run_id = original_run_id
         await db.commit()
-        
+
         return replay_run

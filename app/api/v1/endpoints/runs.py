@@ -22,9 +22,11 @@ from app.schemas import (
     NodeExecutionResponse,
     RunApprovalRequest,
     RunRejectRequest,
+    ReplayRequest,
 )
 from app.services.executor import (
     LEASE_TTL_SECONDS,
+    ReplayValidationError,
     WorkflowExecutor,
     extend_run_lease,
     try_claim_run_lease,
@@ -673,6 +675,7 @@ async def get_run_executions(
 @router.post("/{run_id}/replay", response_model=RunResponse, status_code=201)
 async def replay_run(
     run_id: UUID,
+    replay_data: Optional[ReplayRequest] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_roles("executor"))
 ):
@@ -684,8 +687,19 @@ async def replay_run(
     Stays synchronous (like approve/reject) so the new run's outcome is
     returned directly.
 
-    - Re-executes all nodes with the original inputs
-    - Returns a new run linked via `replayed_from_run_id`
+    Optional body ``{"mode": "recorded" | "re-execute"}`` (default
+    ``re-execute``, unchanged behavior):
+
+    - ``re-execute``: re-runs all nodes with the original inputs (AI nodes
+      call the LLM again; rules re-evaluate against the pinned versions)
+    - ``recorded``: deterministic replay — the original run's recorded node
+      outputs are reused verbatim (never calls the LLM); only allowed for
+      COMPLETED source runs with an intact node-execution trail (otherwise
+      409)
+
+    In both modes the new run is linked via `replayed_from_run_id`.
+
+    - Any other ``mode`` value fails validation (422)
     """
     # Get original run
     result = await db.execute(
@@ -698,13 +712,23 @@ async def replay_run(
     if not original_run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    if original_run.status != RunStatus.COMPLETED:
+    mode = replay_data.mode if replay_data else "re-execute"
+
+    # Existing rule kept for the default mode; recorded mode carries its own
+    # (conflict-shaped, 409) validation for non-COMPLETED sources.
+    if original_run.status != RunStatus.COMPLETED and mode != "recorded":
         raise HTTPException(status_code=400, detail="Can only replay completed runs")
 
     executor = WorkflowExecutor()
-    replayed = await executor.replay(
-        original_run_id=run_id,
-        db=db,
-        triggered_by=current_user.id
-    )
+    try:
+        replayed = await executor.replay(
+            original_run_id=run_id,
+            db=db,
+            triggered_by=current_user.id,
+            mode=mode,
+        )
+    except ReplayValidationError as ve:
+        # Recorded mode cannot replay this run deterministically (wrong
+        # source status, or the recorded node outputs are incomplete).
+        raise HTTPException(status_code=409, detail=str(ve))
     return replayed
